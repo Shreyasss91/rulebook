@@ -28,6 +28,7 @@ PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector
 ```
 rule_books/
 ├── config.yaml                              # Central configuration
+├── requirements.txt                         # Python dependencies (planned ones commented)
 ├── CHANGELOG.md                             # Keep a Changelog format, latest-first
 ├── CLAUDE.md                                # This file
 ├── docs/
@@ -57,18 +58,17 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `docs/kerc_folder_inventory.md` | Corpus scan: 994 PDFs, 25K pages, category breakdown, cost projections |
 | `docs/deduplication_report.md` | 55 duplicate groups detailed |
 | `docs/deduplication_ignore_list.json` | 55 file paths to skip during ingestion |
-| `CHANGELOG.md` | Version history (Keep a Changelog, latest-first). Update it in the same commit as any user-visible change |
+| `CHANGELOG.md` | Version history (Keep a Changelog, latest-first). **Every change must be logged here** — see Conventions |
+| `requirements.txt` | Dependencies. Active block is installed by default; planned deps stay commented so a fresh install works today |
 
 ## Commands
 
 Run scripts from the project root — they resolve `config.yaml` as a relative path.
 
 ```bash
-# Install dependencies (pyyaml is required; pdfplumber/python-docx enable per-type signatures)
-pip install pyyaml pdfplumber python-docx
-
-# For the planned RAG pipeline: pip install sentence-transformers chromadb
-# For OCR: pip install pytesseract ocrmypdf (requires Tesseract binary)
+# Install dependencies (see requirements.txt; pdfplumber/python-docx enable
+# per-type signatures, everything else is commented until its milestone)
+pip install -r requirements.txt
 
 # Scan extensions in configured sources
 python scripts/scan_extensions.py
@@ -122,10 +122,12 @@ Manifest-based (`docs/file_manifest.json`) tracking:
 
 ## Conventions
 
+- **Log every change in `CHANGELOG.md`** — no change is too small to record: new files, script edits, config tweaks, doc fixes, `.gitignore` entries. The changelog entry goes in the *same commit* as the change, never a follow-up. Add the entry under `## [Unreleased]`, or start a new version section (`## [X.Y.Z] - YYYY-MM-DD`) above the previous one, matching the existing Keep a Changelog style (`Added` / `Changed` / `Fixed` / `Documentation` / `Removed`). Also refresh the `Summary Statistics` table at the bottom when counts change.
 - **No hardcoded paths or file types** — every script reads `docs_source`, `file_types`, and output paths from `config.yaml`. Add new sources/extensions to the config, not to code.
 - **Path handling**: `pathlib.Path`; source paths come from a Windows drive (`D:/Office PC/D DRIVE/KERC`) but scripts must keep working when that path is absent (warn and continue).
 - **Deduplication never deletes files** — it only emits an ignore list plus a human-readable report.
 - **Cost-sensitive OCR**: prefer pdfplumber text extraction and fall back to OCR only for low-text pages, per `docs/origin_doc.md`.
+- **Dependencies live in `requirements.txt`** — nothing is installed globally or listed only in prose. Add new deps to the active block; park not-yet-used ones in the commented planned block.
 - **Docs over code comments**: design decisions and analyses go in `docs/*.md`; update the relevant doc when a decision changes.
 - Shell is bash (Git Bash on Windows) — use POSIX commands (`ls`, `mv`, `rm`), not cmd.exe/PowerShell.
 
@@ -140,8 +142,8 @@ Manifest-based (`docs/file_manifest.json`) tracking:
 
 | Milestone | Version |
 |-----------|---------|
-| `scripts/incremental_ingest.py` — manifest-based change detection | v0.8.0 |
-| RAG query CLI with citation support | v0.9.0 |
-| Gradio UI with citations | v1.0.0 |
+| `scripts/incremental_ingest.py` — manifest-based change detection | v0.9.0 |
+| RAG query CLI with citation support | v1.0.0 |
+| Gradio UI with citations | v1.1.0 |
 | OCR pipeline integration (Tesseract + Novita.ai hybrid) | — |
-| Scheduled auto-ingest via cron | v1.1.0 |
+| Scheduled auto-ingest via cron | v1.2.0 |

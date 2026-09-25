@@ -16,6 +16,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-09-25
+
+### Added
+- **Agent Onboarding Guide** (`CLAUDE.md`)
+  - First committed project guide: architecture, repository layout, key files, commands, conventions
+  - Records that scripts resolve `config.yaml` relative to the project root
+  - Records that `pyyaml` is required while `pdfplumber`/`python-docx` are lazily imported (matching file types degrade to a size+path signature instead of failing)
+  - Adds the changelog rule: every change goes in `CHANGELOG.md` in the same commit
+
+- **Dependency Manifest** (`requirements.txt`)
+  - Active block: `pyyaml`, `pdfplumber`, `python-docx`
+  - Commented planned blocks, mirroring the priority tiers in `config.yaml`:
+    - RAG pipeline: `sentence-transformers`, `chromadb`
+    - OCR wrappers: `pytesseract`, `ocrmypdf` (require Tesseract/Ghostscript binaries)
+
+### Changed
+- `.gitignore` now excludes `docs/file_manifest.json`, the generated state file the
+  planned incremental pipeline writes — `docs/incremental_update_strategy.md`
+  described it as ignored, but the entry was missing
+- `CLAUDE.md` install instructions now point at `requirements.txt`
+
+### Documentation
+- `CHANGELOG.md` is maintained per-commit rather than backfilled in batches
+
+---
+
 ## [0.7.0] - 2026-09-25
 
 ### Added
@@ -166,8 +192,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ```
 rule_books/
 ├── config.yaml                    # Central configuration
+├── requirements.txt               # Python dependencies (planned ones commented)
 ├── .gitignore                     # Excludes PDFs, vector DB, temp files
 ├── CHANGELOG.md                   # This file
+├── CLAUDE.md                      # Onboarding guide for coding agents
 ├── docs/
 │   ├── origin_doc.md              # Main architecture & decisions
 │   ├── kerc_folder_inventory.md   # Corpus analysis
@@ -188,10 +216,10 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 12 |
-| **Documents** | 5 markdown files in `docs/` |
-| **Scripts** | 3 Python scripts |
-| **Config** | 1 YAML file |
+| **Commits** | 17 |
+| **Documents** | 6 markdown files (4 in `docs/`, 2 at root) |
+| **Scripts** | 2 Python scripts |
+| **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
 | **Est. OCR Cost** | $0.36–1.10 (deduplicated, via Novita.ai) |
 | **Unique File Types** | 10 extensions found |
@@ -202,7 +230,7 @@ rule_books/
 
 | Milestone | Target |
 |-----------|--------|
-| Incremental ingestion script | v0.8.0 |
-| RAG query CLI | v0.9.0 |
-| Gradio UI with citations | v1.0.0 |
-| Scheduled auto-ingest | v1.1.0 |
+| Incremental ingestion script | v0.9.0 |
+| RAG query CLI | v1.0.0 |
+| Gradio UI with citations | v1.1.0 |
+| Scheduled auto-ingest | v1.2.0 |

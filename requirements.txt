@@ -1,0 +1,27 @@
+# KERC RAG — Python dependencies
+# Install:  pip install -r requirements.txt
+#
+# Only the active block is installed by default. Planned blocks stay commented
+# (mirroring the priority tiers in config.yaml) so a fresh install works today
+# without pulling OCR/vector-DB stacks that no script uses yet.
+
+# --- Active: required by scripts/ today ---------------------------------
+pyyaml>=6.0                # config.yaml loading (scan_extensions.py, dedup script)
+
+# --- Active: optional per-filetype deduplication ------------------------
+# The dedup script imports these lazily. Without them, matching file types
+# fall back to a size+path signature instead of crashing.
+pdfplumber>=0.11.0         # PDF text extraction for content signatures
+python-docx>=1.1.0         # .docx text extraction for content signatures
+
+# --- Planned: RAG pipeline ----------------------------------------------
+# Uncomment when scripts/incremental_ingest.py and the query CLI land.
+# sentence-transformers>=2.7.0   # all-MiniLM-L6-v2 embeddings (local, CPU)
+# chromadb>=0.4.24               # persistent local vector store (kerch_db/)
+
+# --- Planned: OCR fallback ----------------------------------------------
+# These wrappers also need native binaries installed separately (Tesseract for
+# pytesseract; Tesseract + Ghostscript for ocrmypdf), so they are excluded from
+# the default install.
+# pytesseract>=0.3.10
+# ocrmypdf>=16.0.0
