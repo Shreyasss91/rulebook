@@ -138,11 +138,27 @@ dedup signature, page count, chunk count and status per file. Per change type:
 
 - Statuses: `indexed`, `needs_ocr`, `pending_embedding`, `unsupported`, `empty`, `error`.
   Anything left in a retryable status is picked up automatically on a later run once the
-  missing capability exists (flip `OCR_AVAILABLE` in the script when OCR lands).
+  missing capability exists (flip `OCR_AVAILABLE` in the script when OCR lands). Files that keep
+  failing (unreadable, corrupt) are parked after `max_retries` attempts and only surface via `--strict`.
+- Edge cases handled explicitly, because each one looks like a mass change if ignored:
+  - **unreachable source** (unmounted drive, renamed folder) → its previous entries are kept as-is,
+    never treated as DELETED, so a missing `D:` cannot wipe the collection
+  - **overlapping/nested sources** → a file reachable through two roots is processed once
+  - **unreadable file** (locked, permission denied) → `error` status with the reason; the run continues
+  - **zero-byte file** → `empty`; **blank non-PDF** → `empty`; **image-only PDF** → `needs_ocr`
+  - **touched but unchanged** (mtime only) → UNCHANGED, chunks untouched
+  - **case-only rename** on Windows → MOVED, not NEW + DELETED
+  - **rename plus edit** (hash changed, dedup signature identical) → reported as a hint, since only a
+    human can confirm the old chunks should go
+  - **duplicate content** not covered by the ignore list → reported, because both copies get indexed
+  - **stale ignore-list entries** → counted, so the list can be regenerated after big moves
+  - **interrupted run** → the manifest is re-saved every `batch_size` changes, so progress survives
+  - **manifest from a newer script** (`schema_version`) → refused rather than silently downgraded
 - Chunk ids are derived as `sha1("<rel_path>|<content_hash>|<index>")`, so the manifest stores only
   `chunk_count` instead of every id, and chunks are still pruned/updated by metadata filters.
 - Chunks never span pages, so citations keep an exact page number; `.txt`/`.md`/`.docx` have
-  no pages and record `page = -1`.
+  no pages and record `page = -1`. Partially scanned files keep a `pages_without_text` count for
+  the future OCR pass.
 - Without `sentence-transformers`/`chromadb` the run still extracts, chunks and updates the
   manifest (files land in `pending_embedding`); it never blocks on the heavy dependencies.
 
@@ -152,6 +168,7 @@ dedup signature, page count, chunk count and status per file. Per change type:
 - **No hardcoded paths or file types** — every script reads `docs_source`, `file_types`, and output paths from `config.yaml`. Add new sources/extensions to the config, not to code.
 - **Path handling**: `pathlib.Path`; source paths come from a Windows drive (`D:/Office PC/D DRIVE/KERC`) but scripts must keep working when that path is absent (warn and continue).
 - **Deduplication never deletes files** — it only emits an ignore list plus a human-readable report.
+- **The ignore list is written Windows-style** by `create_deduplication_ignore_list_v2.py` (backslashes, from `str(relative_to(source))`) and matched against POSIX-style manifest keys — always normalise separators when comparing paths between the two scripts.
 - **Cost-sensitive OCR**: prefer pdfplumber text extraction and fall back to OCR only for low-text pages, per `docs/origin_doc.md`.
 - **Dependencies live in `requirements.txt`** — nothing is installed globally or listed only in prose. Add new deps to the active block; park not-yet-used ones in the commented planned block.
 - **Docs over code comments**: design decisions and analyses go in `docs/*.md`; update the relevant doc when a decision changes.

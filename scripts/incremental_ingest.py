@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -80,6 +81,7 @@ except ImportError:
 
 SCHEMA_VERSION = 1
 HASH_CHARS = 16
+DEFAULT_MAX_RETRIES = 3
 
 # Change types
 NEW, MODIFIED, MOVED, DELETED, UNCHANGED = "NEW", "MODIFIED", "MOVED", "DELETED", "UNCHANGED"
@@ -102,7 +104,8 @@ OCR_AVAILABLE = False
 
 # Manifest entry fields that survive from the previous run.
 CARRIED_FIELDS = ("content_hash", "signature", "page_count", "has_text_layer",
-                  "chunk_count", "status", "last_processed", "note")
+                  "pages_without_text", "chunk_count", "status", "last_processed",
+                  "attempts", "note")
 
 # Block-level split points for legal text: rule/section headings, all-caps
 # titles, and numbered clauses keep their own block so citations stay exact.
@@ -137,8 +140,20 @@ def load_manifest(path: Path) -> dict:
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if isinstance(version, int) and version > SCHEMA_VERSION:
+        # Refuse rather than silently re-processing a manifest written by a newer
+        # script: the risk is dropping entries the newer schema knows about.
+        raise ValueError(
+            f"manifest {path} uses schema_version {version}, but this script understands "
+            f"{SCHEMA_VERSION} - upgrade the script instead of downgrading the manifest")
     files = data.get("files", data)
     return files if isinstance(files, dict) else {}
+
+
+def normalize_path(value: str | Path) -> str:
+    """Case/separator-insensitive key, so D:/x and d:\\x compare equal on Windows."""
+    return os.path.normcase(str(Path(value).expanduser()))
 
 
 def save_manifest(path: Path, files: dict, stats: dict) -> None:
@@ -150,12 +165,20 @@ def save_manifest(path: Path, files: dict, stats: dict) -> None:
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # ensure_ascii=False keeps Kannada/Unicode filenames readable in the manifest.
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)  # atomic-ish: never leave a half-written manifest behind
 
 
 def load_ignore_list(config: dict) -> set[str]:
-    """Relative paths the dedup run decided to skip (same convention as the ignore list)."""
+    """
+    Paths the dedup run decided to skip.
+
+    The dedup script writes `str(relative_to(source))`, which on Windows contains
+    backslashes, while the manifest keys are POSIX-style. Separators are normalised
+    here and absolute entries are indexed by their normalised form too, so the
+    ignore list keeps working whatever separator the file was produced with.
+    """
     path = Path(config.get("ignore_list_path", ""))
     if not path.exists():
         return set()
@@ -163,7 +186,15 @@ def load_ignore_list(config: dict) -> set[str]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return set()
-    return set(data) if isinstance(data, list) else set()
+    if not isinstance(data, list):
+        return set()
+    entries = set()
+    for item in data:
+        text = str(item).replace("\\", "/")
+        # Absolute entries only get their normalised form, so a matched entry does
+        # not leave a twin behind that looks stale.
+        entries.add(normalize_path(text) if Path(text).is_absolute() else text)
+    return entries
 
 
 # --------------------------------------------------------------------------
@@ -178,19 +209,6 @@ def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()[:HASH_CHARS]
 
 
-def iter_source_files(sources: list[str], file_types: list[str]):
-    """Yield (root, path) for every configured file type below each source."""
-    extensions = {f".{ext.lower().lstrip('.')}" for ext in file_types}
-    for source in sources:
-        root = Path(source).expanduser()
-        if not root.exists():
-            print(f"Warning: source path does not exist, skipping: {root}", file=sys.stderr)
-            continue
-        for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in extensions:
-                yield root, path
-
-
 def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, dict]:
     """
     Build the current manifest.
@@ -200,64 +218,149 @@ def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, d
     the deduplication ignore list are matched on their path relative to their
     source root - the same convention `create_deduplication_ignore_list_v2.py`
     writes - and are left out of the manifest entirely.
+
+    Two situations are handled defensively because they look like mass deletions:
+
+    * an unreachable source (unmounted drive, renamed folder) - its previous
+      entries are kept as-is instead of being reported as DELETED, so a missing
+      D: drive cannot wipe the collection;
+    * overlapping/nested sources - a file reachable through two roots is only
+      processed once, under the first root that sees it.
     """
     sources = config["docs_source"]
     file_types = config.get("file_types", ["pdf"])
     batch_size = config.get("batch_size", 100)
     ignore = load_ignore_list(config)
+    extensions = file_types_extensions(file_types)
 
     current: dict[str, dict] = {}
-    counters = {"scanned": 0, "ignored": 0, "hashed": 0, "missing_deps": set()}
+    counters = {"scanned": 0, "ignored": 0, "hashed": 0, "unreadable": 0,
+                "overlap": 0, "kept_offline": 0}
+    matched_ignores: set[str] = set()
+    seen_paths: set[str] = set()
+    unreachable: list[str] = []
 
-    for index, (root, path) in enumerate(iter_source_files(sources, file_types), start=1):
-        rel = path.relative_to(root).as_posix()
-        counters["scanned"] += 1
-
-        if rel in ignore:
-            counters["ignored"] += 1
+    for source in sources:
+        root = Path(source).expanduser()
+        if not root.exists():
+            unreachable.append(str(root))
             continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in extensions:
+                continue
 
-        stat = path.stat()
-        prev = previous.get(rel)
+            relative = path.relative_to(root).as_posix()
+            absolute = normalize_path(path)
+            if absolute in seen_paths:
+                counters["overlap"] += 1
+                continue
+            seen_paths.add(absolute)
+            counters["scanned"] += 1
 
-        entry = {
-            "root": str(root),
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-        }
-        if prev:
-            # Carry previous results forward so unchanged files stay untouched and
-            # unfinished ones keep the status the retry logic looks at.
-            entry.update({key: prev.get(key) for key in CARRIED_FIELDS})
+            matched_ignore = relative if relative in ignore else (
+                absolute if absolute in ignore else None)
+            if matched_ignore is not None:
+                counters["ignored"] += 1
+                matched_ignores.add(matched_ignore)
+                continue
 
-        unchanged_stat = prev is not None and not full_hash and (
-            prev.get("size") == stat.st_size and prev.get("mtime") == stat.st_mtime
-        )
+            try:
+                stat = path.stat()
+            except OSError as exc:
+                counters["unreadable"] += 1
+                current[relative] = {
+                    "root": str(root), "size": None, "mtime": None,
+                    "status": ERROR, "note": f"unreadable: {type(exc).__name__}: {exc}",
+                }
+                continue
 
-        if unchanged_stat:
-            current[rel] = entry
-        else:
-            entry["content_hash"] = hash_file(path)
+            prev = previous.get(relative)
+            entry = {
+                "root": str(root),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            }
+            if prev:
+                # Carry previous results forward so unchanged files stay untouched and
+                # unfinished ones keep the status the retry logic looks at.
+                entry.update({key: prev.get(key) for key in CARRIED_FIELDS})
+
+            unchanged_stat = prev is not None and not full_hash and (
+                prev.get("size") == stat.st_size and prev.get("mtime") == stat.st_mtime
+            )
+
+            if unchanged_stat:
+                current[relative] = entry
+                continue
+
+            try:
+                entry["content_hash"] = hash_file(path)
+                if get_file_signature is not None:
+                    entry["signature"] = get_file_signature(path, config)
+            except OSError as exc:
+                counters["unreadable"] += 1
+                entry.update({"status": ERROR, "attempts": 0,
+                              "note": f"unreadable: {type(exc).__name__}: {exc}"})
+                current[relative] = entry
+                continue
+
             counters["hashed"] += 1
-            if get_file_signature is not None:
-                entry["signature"] = get_file_signature(path, config)
-            current[rel] = entry
+            current[relative] = entry
 
-        if index % batch_size == 0:
-            print(f"  scanned {index} files...", flush=True)
+            if counters["scanned"] % batch_size == 0:
+                print(f"  scanned {counters['scanned']} files...", flush=True)
 
+    # A source that is simply not there (drive unplugged) must not look like every
+    # file in it was deleted: keep those entries untouched this run.
+    unreachable_keys = {normalize_path(root) for root in unreachable}
+    for relative, entry in previous.items():
+        if relative not in current and normalize_path(entry.get("root", "")) in unreachable_keys:
+            current[relative] = dict(entry)
+            counters["kept_offline"] += 1
+
+    # Content duplicates that the dedup ignore list does not cover would be indexed
+    # twice under two ids; report them rather than silently doubling the corpus.
+    by_hash: dict[str, list[str]] = defaultdict(list)
+    for relative, entry in current.items():
+        if entry.get("content_hash"):
+            by_hash[entry["content_hash"]].append(relative)
+    counters["duplicate_groups"] = sorted(
+        sorted(paths) for paths in by_hash.values() if len(paths) > 1)
+
+    counters["stale_ignores"] = sorted(ignore - matched_ignores)
+    counters["unreachable"] = unreachable
+    counters["nested_sources"] = nested_source_pairs(sources)
     return current, counters
+
+
+def file_types_extensions(file_types: list[str]) -> set[str]:
+    return {f".{ext.lower().lstrip('.')}" for ext in file_types}
+
+
+def nested_source_pairs(sources: list[str]) -> list[tuple[str, str]]:
+    """(outer, inner) source pairs where one configured root sits inside another."""
+    roots = [Path(source).expanduser() for source in sources]
+    pairs = []
+    for outer in roots:
+        for inner in roots:
+            if outer != inner and inner.is_relative_to(outer):
+                pairs.append((str(outer), str(inner)))
+    return pairs
 
 
 # --------------------------------------------------------------------------
 # Classification
 # --------------------------------------------------------------------------
 
-def needs_reprocessing(prev_entry: dict, can_embed: bool) -> str | None:
+def needs_reprocessing(prev_entry: dict, can_embed: bool, max_retries: int) -> str | None:
     """Return a reason to re-process a file whose content is unchanged, else None."""
     status = prev_entry.get("status")
     if status == NEEDS_OCR:
         return "retry: OCR available" if OCR_AVAILABLE else None
+    if status == ERROR and prev_entry.get("attempts", 0) >= max_retries:
+        # Repeated failures (corrupt file, permission problem) are parked and
+        # surfaced by --strict instead of retried on every run.
+        return None
     if status in RETRYABLE and can_embed:
         return f"retry: previous run ended in {status}"
     return None
@@ -266,6 +369,7 @@ def needs_reprocessing(prev_entry: dict, can_embed: bool) -> str | None:
 def classify(current: dict, previous: dict, config: dict, can_embed: bool) -> list[dict]:
     track_moves = config.get("track_moves", True)
     track_deletions = config.get("track_deletions", True)
+    max_retries = config.get("max_retries", DEFAULT_MAX_RETRIES)
 
     # Paths that vanished, grouped by content hash so a move can be recognised.
     vanished = {path: entry for path, entry in previous.items() if path not in current}
@@ -296,7 +400,7 @@ def classify(current: dict, previous: dict, config: dict, can_embed: bool) -> li
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev})
             continue
 
-        reason = needs_reprocessing(prev, can_embed)
+        reason = needs_reprocessing(prev, can_embed, max_retries)
         if reason:
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev,
                             "reason": reason})
@@ -422,6 +526,12 @@ def chunk_text(text: str, block_heading: str | None, config: dict) -> list[dict]
             if not buffer:
                 buffer, section = piece, heading or block_heading
             elif len(buffer) + len(piece) + 1 <= size:
+                buffer = f"{buffer}\n{piece}"
+            elif len(buffer) < minimum:
+                # A runt buffer is almost always a heading line or the tail of the
+                # previous chunk. Emitting it alone would index a fragment with no
+                # content, so stay attached to what follows even if that overshoots
+                # `chunk_size` (new content is still capped at `size` per piece).
                 buffer = f"{buffer}\n{piece}"
             else:
                 chunks.append({"text": buffer.strip(), "section": section})
@@ -552,14 +662,34 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
     rel = change["path"]
     entry = change["entry"]
     path = Path(entry["root"]) / rel
+    suffix = path.suffix.lower()
+
+    if not entry.get("content_hash"):
+        # Unreadable at scan time: chunk ids could not be derived, so leave it alone.
+        return ERROR, 0, entry.get("note") or "no content hash (file unreadable)"
+
+    if entry.get("size") == 0:
+        return EMPTY, 0, "zero-byte file"
 
     pages, error = extract_pages(path, config)
     if pages is None:
         return UNSUPPORTED, 0, error
     if error:
         return ERROR, 0, error
-    if not pages or not has_text_layer(pages, config):
-        return NEEDS_OCR, 0, "no usable text layer - OCR not implemented yet"
+
+    blank_pages = [page for page in pages if len(page["text"].strip()) < 10]
+    has_text = sum(len(page["text"].strip()) for page in pages) > 0
+
+    if not has_text:
+        # An image-only PDF needs OCR; a blank text file is just empty.
+        if suffix == ".pdf":
+            return NEEDS_OCR, 0, "no text layer (image-only PDF) - OCR not implemented yet"
+        return EMPTY, 0, "no extractable text"
+
+    if suffix == ".pdf" and not has_text_layer(pages, config):
+        minimum = config.get("ocr_min_chars_per_page", 50)
+        return NEEDS_OCR, 0, (f"text layer below {minimum} chars/page - "
+                              "OCR not implemented yet")
 
     chunks = build_chunks(pages, config)
     if not chunks:
@@ -567,6 +697,7 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
 
     entry["page_count"] = len(pages)
     entry["has_text_layer"] = True
+    entry["pages_without_text"] = len(blank_pages)
     entry["chunk_count"] = len(chunks)
 
     if not can_embed or collection is None:
@@ -579,84 +710,115 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
     return INDEXED, indexed, None
 
 
-def apply_changes(changes: list[dict], config: dict, previous: dict,
-                  current: dict, dry_run: bool, can_embed: bool, verbose: bool) -> dict:
+def apply_one_change(change: dict, config: dict, previous: dict, current: dict, stats: dict,
+                     embedder: Embedder, collection, can_embed: bool, verbose: bool) -> None:
+    """Apply a single classified change, updating `current` and `stats` in place."""
+    kind = change["type"]
+    rel = change["path"]
+    entry = current.get(rel) or change.get("entry") or {}
+
+    # A file that moved but was never successfully indexed (needs_ocr,
+    # pending_embedding, error) has no chunks to re-label, so it is
+    # re-processed under its new path instead.
+    if kind == MOVED:
+        old_status = previous.get(change["old_path"], {}).get("status")
+        if old_status is None or old_status in RETRYABLE:
+            kind = MODIFIED
+            change["type"] = kind
+            change["reason"] = f"moved from {change['old_path']}, never indexed"
+            if collection is not None:
+                delete_chunks(collection, change["old_path"])
+
+    stats[kind] += 1
+
+    if kind == UNCHANGED:
+        log(f"  {UNCHANGED:<9} {rel}" + (f"  ({change.get('reason')})" if change.get("reason") else ""),
+            verbose_only=True, verbose=verbose)
+        # Kept when deletions are not tracked, so the entry (and its chunks)
+        # survive until the file reappears.
+        if change.get("keep"):
+            current[rel] = entry
+        return
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    if kind == DELETED:
+        if collection is not None:
+            delete_chunks(collection, rel)
+        current.pop(rel, None)
+        log(f"  {DELETED:<9} {rel}")
+        return
+
+    if kind == MOVED:
+        old_entry = previous[change["old_path"]]
+        moved = move_chunks(collection, change["old_path"], rel, entry["root"]) if collection else 0
+        # Nothing is re-processed, so the old path's results carry over.
+        for field in CARRIED_FIELDS:
+            if old_entry.get(field) is not None:
+                entry[field] = old_entry[field]
+        entry["last_processed"] = now
+        stats["chunks_moved"] += moved
+        log(f"  {MOVED:<9} {rel}  (from {change['old_path']}, {moved} chunks re-labelled)")
+        current[rel] = entry
+        return
+
+    status, chunk_count, note = process_new_or_modified(
+        {"path": rel, "entry": entry}, config, embedder, collection, can_embed)
+    entry["status"] = status
+    entry["last_processed"] = now
+    entry["chunk_count"] = chunk_count
+    # Attempts drive the retry ceiling for repeated failures; settled files reset it.
+    if status in RETRYABLE:
+        entry["attempts"] = entry.get("attempts", 0) + 1
+    else:
+        entry["attempts"] = 0
+    if note:
+        entry["note"] = note
+    else:
+        entry.pop("note", None)
+    current[rel] = entry
+
+    stats[status] += 1
+    stats["chunks_indexed" if status == INDEXED else "chunks_pending"] += chunk_count
+    detail = f", {chunk_count} chunks" if chunk_count else ""
+    message = f"  {kind:<9} {rel} -> {status}{detail}"
+    if note:
+        message += f"  ({note})"
+    log(message, verbose_only=(status == INDEXED), verbose=verbose)
+
+
+def apply_changes(changes: list[dict], config: dict, previous: dict, current: dict,
+                  dry_run: bool, can_embed: bool, verbose: bool,
+                  save_cb=None) -> dict:
+    """
+    Apply every change. `save_cb` (when given) is called every `batch_size`
+    changes so an interrupted run on the full corpus keeps its progress.
+    """
     stats = defaultdict(int)
     embedder = Embedder(config)
     collection = None if dry_run else open_collection(config)
+    save_every = config.get("batch_size", 100)
+    pending = sum(1 for change in changes if change["type"] != UNCHANGED)
+    processed = 0
 
     for change in changes:
-        kind = change["type"]
-        rel = change["path"]
-        entry = current.get(rel) or change.get("entry") or {}
-
-        # A file that moved but was never successfully indexed (needs_ocr,
-        # pending_embedding, error) has no chunks to re-label, so it is
-        # re-processed under its new path instead.
-        if kind == MOVED:
-            old_status = previous.get(change["old_path"], {}).get("status")
-            if old_status is None or old_status in RETRYABLE:
-                kind = MODIFIED
-                change["type"] = kind
-                change["reason"] = f"moved from {change['old_path']}, never indexed"
-                if collection is not None:
-                    delete_chunks(collection, change["old_path"])
-
-        stats[kind] += 1
-
-        if kind == UNCHANGED:
-            log(f"  {UNCHANGED:<9} {rel}" + (f"  ({change.get('reason')})" if change.get("reason") else ""),
-                verbose_only=True, verbose=verbose)
-            # Kept when deletions are not tracked, so the entry (and its chunks)
-            # survive until the file reappears.
-            if change.get("keep"):
-                current[rel] = entry
+        if dry_run and change["type"] in (NEW, MODIFIED, DELETED):
+            # Nothing to apply; planned actions are listed in the summary below.
+            stats[change["type"]] += 1
             continue
 
-        if dry_run:
-            # Planned actions are listed once, in the summary block below.
+        # UNCHANGED and MOVED still go through in dry-run: the log line and the
+        # "moved but never indexed" reclassification belong in the report.
+        apply_one_change(change, config, previous, current, stats, embedder,
+                         collection, can_embed, verbose)
+
+        if dry_run or change["type"] == UNCHANGED:
             continue
-
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-        if kind == DELETED:
-            if collection is not None:
-                delete_chunks(collection, rel)
-            current.pop(rel, None)
-            log(f"  {DELETED:<9} {rel}")
-            continue
-
-        if kind == MOVED:
-            old_entry = previous[change["old_path"]]
-            moved = move_chunks(collection, change["old_path"], rel, entry["root"]) if collection else 0
-            # Nothing is re-processed, so the old path's results carry over.
-            for field in CARRIED_FIELDS:
-                if old_entry.get(field) is not None:
-                    entry[field] = old_entry[field]
-            entry["last_processed"] = now
-            stats["chunks_moved"] += moved
-            log(f"  {MOVED:<9} {rel}  (from {change['old_path']}, {moved} chunks re-labelled)")
-            current[rel] = entry
-            continue
-
-        status, chunk_count, note = process_new_or_modified(
-            {"path": rel, "entry": entry}, config, embedder, collection, can_embed)
-        entry["status"] = status
-        entry["last_processed"] = now
-        entry["chunk_count"] = chunk_count
-        if note:
-            entry["note"] = note
-        else:
-            entry.pop("note", None)
-        current[rel] = entry
-
-        stats[status] += 1
-        stats["chunks_indexed" if status == INDEXED else "chunks_pending"] += chunk_count
-        detail = f", {chunk_count} chunks" if chunk_count else ""
-        message = f"  {kind:<9} {rel} -> {status}{detail}"
-        if note:
-            message += f"  ({note})"
-        log(message, verbose_only=(status == INDEXED), verbose=verbose)
+        processed += 1
+        if save_every and processed % save_every == 0:
+            if save_cb:
+                save_cb()
+            print(f"  ... {processed}/{pending} changes processed", flush=True)
 
     return stats
 
@@ -664,6 +826,65 @@ def apply_changes(changes: list[dict], config: dict, previous: dict,
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def report_warnings(scan_stats: dict, current: dict, changes: list[dict]) -> None:
+    """Surface the situations that need a human eye, not just a status change."""
+    for source in scan_stats.get("unreachable", []):
+        print(f"Warning: source not reachable, kept {scan_stats['kept_offline']} file(s) "
+              f"as-is instead of deleting them: {source}", file=sys.stderr)
+    for outer, inner in scan_stats.get("nested_sources", []):
+        print(f"Warning: source {inner} is inside {outer}; those files are processed once "
+              "under the outer root", file=sys.stderr)
+    if scan_stats.get("overlap"):
+        print(f"Note: {scan_stats['overlap']} file(s) reachable through two sources were "
+              "counted once")
+    if scan_stats.get("unreadable"):
+        print(f"Note: {scan_stats['unreadable']} file(s) could not be read", file=sys.stderr)
+    duplicates = scan_stats.get("duplicate_groups") or []
+    if duplicates:
+        extra = len(duplicates) - 3
+        print(f"Note: {len(duplicates)} content duplicate group(s) are not in the dedup "
+              f"ignore list, so each copy is indexed: {duplicate_sample(duplicates)}"
+              + (f" (+{extra} more)" if extra > 0 else ""))
+    # With --source the ignore list still belongs to the configured sources, so
+    # "stale entry" would be reported for every file outside the override scope.
+    if scan_stats.get("stale_ignores") and not scan_stats.get("sources_overridden"):
+        print(f"Note: {len(scan_stats['stale_ignores'])} ignore-list entr(ies) match no "
+              f"current file (stale after a move or rename): "
+              f"{', '.join(scan_stats['stale_ignores'][:3])}")
+    mixed = [(rel, entry) for rel, entry in sorted(current.items())
+             if entry.get("pages_without_text")]
+    if mixed:
+        pages = sum(entry["pages_without_text"] for _, entry in mixed)
+        print(f"Note: {len(mixed)} indexed file(s) have {pages} page(s) with no text "
+              "(OCR candidates once the OCR stage lands)")
+    for hint in rename_hints(changes):
+        print(f"Note: {hint}")
+
+
+def duplicate_sample(duplicates: list[list[str]]) -> str:
+    return "; ".join(" = ".join(paths) for paths in duplicates[:3])
+
+
+def rename_hints(changes: list[dict]) -> list[str]:
+    """
+    A NEW file sharing a dedup signature with a vanished one is usually a rename
+    plus an edit. Content differs, so it cannot be a move - but leaving both sets of
+    chunks indexes the document twice, so flag it for a human instead.
+    """
+    deleted = {change["entry"].get("signature"): change["path"] for change in changes
+               if change["type"] == DELETED and change["entry"].get("signature")}
+    hints = []
+    for change in changes:
+        if change["type"] != NEW:
+            continue
+        signature = change["entry"].get("signature")
+        if signature and signature in deleted:
+            hints.append(f"{deleted[signature]} disappeared while {change['path']} appeared with "
+                         "the same content signature - if it was renamed and edited, the old "
+                         "chunks need removing to avoid duplicates")
+    return hints
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -696,17 +917,28 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path = Path(args.manifest or config.get("manifest_path", "docs/file_manifest.json"))
     sources = [str(Path(s).expanduser()) for s in config["docs_source"]]
 
-    previous = load_manifest(manifest_path)
+    try:
+        previous = load_manifest(manifest_path)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Cannot read manifest: {exc}", file=sys.stderr)
+        return 1
     current, scan_stats = scan_sources(config, previous, args.full_hash)
+    scan_stats["sources_overridden"] = bool(args.source)
 
     can_embed = Embedder.available() and chromadb is not None
 
     changes = classify(current, previous, config, can_embed)
-    stats = apply_changes(changes, config, previous, current, args.dry_run, can_embed, args.verbose)
 
-    if not args.dry_run:
+    def save_now() -> None:
         save_manifest(manifest_path, current, {"scanned": scan_stats["scanned"],
                                               "ignored": scan_stats["ignored"]})
+
+    stats = apply_changes(changes, config, previous, current, args.dry_run, can_embed,
+                          args.verbose, save_cb=None if args.dry_run else save_now)
+
+    if not args.dry_run:
+        # Final save; apply_changes also saved every batch_size changes.
+        save_now()
 
     counts = {kind: sum(1 for c in changes if c["type"] == kind)
               for kind in (NEW, MODIFIED, MOVED, DELETED, UNCHANGED)}
@@ -716,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Changes: " + ", ".join(f"{counts[k]} {k}" for k in counts))
     if not can_embed:
         print("Mode: manifest-only (sentence-transformers/chromadb unavailable)")
+    report_warnings(scan_stats, current, changes)
     if not args.dry_run:
         print(f"Indexed: {stats.get('chunks_indexed', 0)} chunks"
               + (f", re-labelled {stats['chunks_moved']}" if stats.get("chunks_moved") else ""))

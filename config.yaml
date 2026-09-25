@@ -38,6 +38,7 @@ signature_prefix_chars: 300
 manifest_path: "docs/file_manifest.json"
 track_moves: true          # same content_hash at a new path = MOVED, not NEW+DELETED
 track_deletions: true      # drop chunks for files that disappeared
+max_retries: 3             # give up on repeatedly failing files (unreadable/corrupt)
 
 # Chunking — legal-aware, so rule/section numbering stays intact
 chunk_size: 1200           # target characters per chunk

@@ -13,6 +13,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build RAG query interface (CLI + Gradio UI) with citation support
 - Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)
 - Add spreadsheet extraction (xlsx/xls/xlsm/csv) so those files stop reporting `unsupported`
+- Signature-based move detection for renames that also edit content (now a hint only)
+
+---
+
+## [0.10.0] - 2026-09-25
+
+### Fixed
+- **Ignore list never matched on Windows** — `create_deduplication_ignore_list_v2.py` writes
+  `str(relative_to(source))`, which contains backslashes, while the manifest uses POSIX keys. Every
+  entry in `docs/deduplication_ignore_list.json` was silently ignored, so the 55 deduplicated files
+  would have been indexed a second time. Separators are normalised on load, absolute entries match by
+  normalised absolute path, and both cases now have tests
+- **A missing source wiped the collection** — if `docs_source` was unreachable (drive unplugged,
+  folder renamed), every file in it was reported DELETED and its chunks dropped. Entries of an
+  unreachable root are now kept as-is and the situation is warned about
+- **Heading fragments were indexed as chunks** — a heading line could become a 10-character chunk of
+  its own. A short buffer now stays attached to the content that follows it
+
+### Added
+- **Chunking robustness**: `chunk_text` keeps runts merged, so no text is dropped just because it is
+  short, and every chunk carries its section heading
+- **Edge-case handling in `incremental_ingest.py`**:
+  - unreadable/locked files → `error` status with the reason instead of crashing the run
+  - zero-byte and blank files → `empty`; only PDFs are treated as OCR candidates
+  - partially scanned PDFs → `pages_without_text` recorded for the future OCR pass
+  - overlapping/nested `docs_source` entries → scanned once, with a warning
+  - duplicate content outside the ignore list → reported, since each copy is indexed
+  - stale ignore-list entries → counted so the list can be regenerated
+  - rename-plus-edit (hash changed, dedup signature identical) → reported as a hint
+  - `max_retries` (default 3) parks repeatedly failing files; `--strict` still flags them
+  - the manifest is re-saved every `batch_size` changes, so an interrupted run keeps its progress
+  - a manifest with a newer `schema_version` is refused instead of silently re-processed
+- `config.yaml`: `max_retries` setting
+
+### Documentation
+- `CLAUDE.md` documents the edge cases and the ignore-list separator pitfall
+- `docs/incremental_update_strategy.md` lists the situations beyond the original four scenarios
 
 ---
 

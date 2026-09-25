@@ -168,9 +168,29 @@ sketch in this document, and why:
 | Move = metadata update | Same, plus: a move of a file that was never indexed is reprocessed instead | Re-labelling zero chunks would silently lose the file |
 
 Ignore-list entries are matched on the path relative to their source root (the same
-convention `create_deduplication_ignore_list_v2.py` writes). With more than one entry in
-`docs_source`, an entry can therefore match a file in each source — keep ignore-list paths
-unique, or run one source at a time.
+convention `create_deduplication_ignore_list_v2.py` writes). The dedup script emits Windows
+separators (`str(relative_to(source))`), so separators are normalised on load; absolute entries
+match by their normalised absolute path. With more than one entry in `docs_source`, an entry can
+therefore match a file in each source — keep ignore-list paths unique, or run one source at a time.
+
+### Edge cases beyond the original four scenarios
+
+These were not in the first sketch, but each one presents itself as a mass change if ignored:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Source unreachable (unmounted `D:`, renamed folder) | Previous entries for that root are kept untouched; nothing is reported as DELETED, so an offline drive cannot empty the collection |
+| Overlapping/nested `docs_source` entries | A file reachable through two roots is scanned once (under the outer root) and the nesting is warned about |
+| File locked / permission denied | `error` status with the reason, run continues; retried up to `max_retries`, then parked for `--strict` |
+| Zero-byte file, blank text file | `empty` (not `needs_ocr` — there is nothing to OCR) |
+| Image-only or low-text PDF | `needs_ocr`, with `pages_without_text` recorded for partially scanned files |
+| Touched but unchanged (mtime only) | UNCHANGED; the new mtime is stored, no re-embedding |
+| Case-only rename on Windows | MOVED via content hash, no re-embedding |
+| Renamed **and** edited | Content hash differs but the dedup signature matches → reported as a hint; the old chunks need a human decision instead of being dropped automatically |
+| Duplicate content not in the ignore list | Reported at the end of the run, because each copy is indexed under its own id |
+| Stale ignore-list entries | Counted at the end of the run so the list can be regenerated after large moves |
+| Run interrupted (Ctrl-C, crash) | The manifest is re-saved every `batch_size` changes, so completed work is not repeated |
+| Manifest written by a newer script | Refused via `schema_version` instead of being silently re-processed |
 
 ## Next Steps
 
@@ -180,6 +200,8 @@ unique, or run one source at a time.
 4. ~~Test all 4 scenarios~~ ✅ verified on a scratch corpus: add, add-subfolder, edit, move, delete, plus rerun idempotency and dependency-less runs
 5. Add xlsx/xls/csv extraction (currently `unsupported`) and the OCR pipeline (`needs_ocr`)
 6. Schedule via cron (`--strict` exits 2 while files are blocked) or run manually after changes
+7. Consider signature-based move detection for renames that also edit content — today they are
+   reported as a hint only, because a wrong automatic merge would silently drop a document
 
 ---
 
