@@ -179,6 +179,11 @@ dedup signature, page count, chunk count and status per file. Per change type:
 
 ## Conventions
 
+- **Split commits by task, not by session.** When the working tree holds several unrelated changes,
+  commit them separately — one commit per feature, bug fix, gap, refactor or docs change — never one
+  large "misc changes" commit. Each commit should be reviewable and revertable on its own, so use
+  `git add <paths>` per group instead of `git add -A`, and make sure the code and its changelog entry
+  land in the same commit. Commit messages explain the *why*, not the file list.
 - **Log every change in `CHANGELOG.md`** — no change is too small to record: new files, script edits, config tweaks, doc fixes, `.gitignore` entries. The changelog entry goes in the *same commit* as the change, never a follow-up. Add the entry under `## [Unreleased]`, or start a new version section (`## [X.Y.Z] - YYYY-MM-DD`) above the previous one, matching the existing Keep a Changelog style (`Added` / `Changed` / `Fixed` / `Documentation` / `Removed`). Also refresh the `Summary Statistics` table at the bottom when counts change.
 - **No hardcoded paths or file types** — every script reads `docs_source`, `file_types`, and output paths from `config.yaml`. Add new sources/extensions to the config, not to code.
 - **Path handling**: `pathlib.Path`; source paths come from a Windows drive (`D:/Office PC/D DRIVE/KERC`) but scripts must keep working when that path is absent (warn and continue).

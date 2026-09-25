@@ -63,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 - `CLAUDE.md` documents the edge cases and the ignore-list separator pitfall
 - `docs/incremental_update_strategy.md` lists the situations beyond the original four scenarios
+- `CLAUDE.md` requires commits to be split per task/feature/fix/gap rather than bundled into one
+  large commit, with the changelog entry landing in the same commit as the code
 
 ---
 
