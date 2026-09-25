@@ -52,6 +52,76 @@ pip install pytesseract pdf2image ocrmypdf
 
 ---
 
+## OCR Engine Comparison: Tesseract vs DeepSeek OCR
+
+### Quick Comparison
+
+| Aspect | **Tesseract (v5.x)** | **DeepSeek OCR** |
+|--------|---------------------|------------------|
+| **Type** | Traditional OCR engine (open-source) | LLM-based vision model (API) |
+| **Architecture** | LSTM + character classification | Multimodal transformer |
+| **License** | Apache 2.0 (free, commercial OK) | Proprietary (API only) |
+| **Cost** | Free (local compute only) | Pay-per-call (~$0.001-0.01/page) |
+| **Privacy** | 100% local | Data sent to DeepSeek servers |
+
+### Accuracy by Document Type
+
+| Document Type | Tesseract | DeepSeek OCR |
+|---------------|-----------|--------------|
+| Clean printed text | ★★★★★ | ★★★★★ |
+| Scanned legal/regulatory PDFs | ★★★★☆ | ★★★★★ |
+| Tables/structured data | ★★☆☆☆ (needs post-processing) | ★★★★☆ (understands structure) |
+| Handwriting | ★★☆☆☆ | ★★★★☆ |
+| Low-quality/noisy scans | ★★☆☆☆ | ★★★★☆ |
+| Multi-column layouts | ★★★☆☆ | ★★★★★ |
+| Mathematical formulas | ★★☆☆☆ | ★★★★☆ |
+
+### For KERC Regulatory PDFs Specifically
+
+| Factor | Tesseract | DeepSeek OCR |
+|--------|-----------|--------------|
+| **Scanned government orders** | Good with 300+ DPI | Excellent even at 150 DPI |
+| **Tables in tariff orders** | Poor (needs Camelot/Tabula) | Good (outputs markdown/JSON) |
+| **Kannada/English mixed** | Needs trained model | Handles natively |
+| **Section/Rule numbering** | Preserves but no understanding | Understands hierarchy |
+| **Batch processing 50+ PDFs** | Fast local, parallelizable | API rate limits, cost adds up |
+
+### Recommended: Hybrid Approach (Best of Both)
+
+```python
+# 1. First pass: ocrmypdf (Tesseract) on all PDFs
+#    ocrmypdf --language eng+kan input.pdf output_searchable.pdf
+
+# 2. Flag low-confidence pages
+#    ocrmypdf --output-type pdf --pdf-renderer hocr ...
+
+# 3. Re-process flagged pages with DeepSeek OCR API
+#    Only ~5-10% of pages typically need this
+```
+
+### Cost Estimate for 50 PDFs
+
+| Approach | Est. Cost | Time |
+|----------|-----------|------|
+| Tesseract only (local) | $0 | 10-30 min |
+| DeepSeek OCR only (API) | ~$5-20 | Rate-limited |
+| **Hybrid (90% Tesseract + 10% DeepSeek)** | **~$1-3** | **15-45 min** |
+
+### Decision
+
+| Your Situation | Use |
+|----------------|-----|
+| **Bulk processing, privacy, free** | Tesseract via `ocrmypdf` |
+| **Difficult pages Tesseract fails on** | DeepSeek OCR (selective) |
+| **Need structured table output (markdown/JSON)** | DeepSeek OCR |
+| **Handwritten marginalia in regulations** | DeepSeek OCR |
+
+**Start with Tesseract/ocrmypdf for the full corpus.** It makes PDFs searchable permanently, handles your volume for free, keeps data local. Only reach for DeepSeek OCR on specific problematic pages.
+
+---
+
+## Quick Start Prototype (Updated with OCR)
+
 ## Quick Start Prototype (Updated with OCR)
 
 ### requirements.txt
