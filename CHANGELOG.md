@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the manifest is re-saved every `batch_size` changes, so an interrupted run keeps its progress
   - a manifest with a newer `schema_version` is refused instead of silently re-processed
 - `config.yaml`: `max_retries` setting
+- **Test suite** (`tests/test_incremental_ingest.py`, 48 tests, `python -m pytest`)
+  - chunking: block splitting, heading attachment, overlap, page attribution
+  - extraction: text files, unsupported formats, exceptions turned into notes
+  - classification: all five change types, moves, deletion tracking, OCR/retry gating,
+    attempts ceiling
+  - scanning: ignore-list matching (POSIX, backslash and absolute entries), stale entries,
+    the size+mtime fast path, unreadable files, nested sources, offline sources, duplicate grouping
+  - end-to-end runs against a fake vector store: first run, no-op rerun, edit, move, delete,
+    new subfolder, dry run, touched file, case-only rename, offline source, pending-embedding retry,
+    image-only and mixed PDFs, zero-byte file, unsupported type, parked errors, strict mode,
+    manifest schema/broken-JSON guards, duplicate and rename-hint reporting, batch progress
+  - no sentence-transformers/chromadb/model download needed
+- `requirements.txt`: `pytest` in an active development block
 
 ### Documentation
 - `CLAUDE.md` documents the edge cases and the ignore-list separator pitfall

@@ -82,11 +82,26 @@ python scripts/incremental_ingest.py --dry-run -v
 
 # Incremental ingest: apply them
 python scripts/incremental_ingest.py
+
+# Tests (no ChromaDB, no model download needed)
+python -m pytest
 ```
 
 `create_deduplication_ignore_list_v2.py` imports `pdfplumber` and `python-docx` optionally: PDFs are skipped if pdfplumber is missing. It is resumable via `docs/deduplication_progress.json` and processes `batch_size` files per batch.
 
 `incremental_ingest.py` also accepts `--full-hash` (re-hash everything instead of trusting size+mtime), `--strict` (exit 2 when files are left blocked, for cron), and `--source`/`--manifest`/`--chroma-path` overrides for testing against a scratch corpus.
+
+## Tests
+
+`tests/test_incremental_ingest.py` covers chunking, extraction, classification, the scanning edge
+cases and end-to-end runs. The vector store and the embedding model are faked, so the suite needs
+neither chromadb/sentence-transformers nor a model download — keep it that way, and add a test with
+every behaviour change to `incremental_ingest.py`.
+
+```bash
+python -m pytest              # everything
+python -m pytest -k classify  # one area
+```
 
 ## Config Structure (`config.yaml`)
 

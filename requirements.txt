@@ -8,6 +8,9 @@
 # --- Active: required by scripts/ today ---------------------------------
 pyyaml>=6.0                # config.yaml loading (scan_extensions.py, dedup script)
 
+# --- Active: development / tests ----------------------------------------
+pytest>=8.0                # python -m pytest  (tests/)
+
 # --- Active: optional per-filetype deduplication ------------------------
 # The dedup script imports these lazily. Without them, matching file types
 # fall back to a size+path signature instead of crashing.
