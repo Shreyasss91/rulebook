@@ -1,0 +1,10 @@
+{
+  "docs_source": [
+    "D:/Office PC/D DRIVE/KERC"
+  ],
+  "file_types": ["pdf", "txt", "docx", "doc", "md"],
+  "ignore_list_path": "docs/deduplication_ignore_list.json",
+  "progress_path": "docs/deduplication_progress.json",
+  "batch_size": 100,
+  "signature_prefix_chars": 300
+}
