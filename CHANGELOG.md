@@ -16,79 +16,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.0] - 2026-09-25
+## [0.7.0] - 2026-09-25
 
 ### Added
-- **Initial RAG Architecture** (`docs/origin_doc.md`)
-  - Local-first RAG pipeline design for KERC regulatory documents
-  - Architecture: PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector DB → LLM Query → Cited Answers
-  - Stack: ChromaDB, sentence-transformers, Ollama/Claude API, pdfplumber, LangChain/LlamaIndex
-
-- **OCR Engine Integration**
-  - Tesseract via `pytesseract` and `ocrmypdf` for searchable PDF layer
-  - Fallback strategy: pdfplumber first, OCR only for low-text pages
-  - Dependencies documented for Windows installation
-
-- **Option A vs Option B Comparison**
-  - Option A: Custom Python prototype (full control, legal-aware chunking, custom citations)
-  - Option B: Existing tools (AnythingLLM, Kotaemon, PrivateGPT)
-  - Decision matrix for choosing based on priorities
+- **Incremental Update Strategy** (`docs/incremental_update_strategy.md`)
+  - Problem statement: handling edits, additions, new subfolders, moves after initial indexing
+  - Manifest-based approach: `docs/file_manifest.json` tracking path, hash, mtime, chunks
+  - Change classification: NEW, MODIFIED, MOVED, DELETED, UNCHANGED
+  - Per-component incremental strategies (dedup, OCR, chunking, embeddings, vector DB)
+  - ChromaDB operations for each change type (upsert, delete, update metadata)
+  - Three implementation options with recommendation (custom manifest for control)
 
 ### Documentation
-- `docs/origin_doc.md` — Complete architecture and comparison document
+- Complete incremental strategy document with code examples
 
 ---
 
-## [0.2.0] - 2026-09-25
+## [0.6.0] - 2026-09-25
 
 ### Added
-- **Tesseract vs DeepSeek OCR Comparison** (`docs/origin_doc.md`)
-  - Detailed accuracy comparison by document type (clean text, tables, handwriting, multi-column, formulas)
-  - KERC-specific assessment: government orders, tariff tables, Kannada/English mixed, rule numbering
-  - Hybrid approach recommendation: 90% Tesseract + 10% DeepSeek OCR API
+- **Configuration System** (`config.yaml`)
+  - YAML-based config (replaced JSON)
+  - Multi-source support: `docs_source` as list of folders
+  - Multi-filetype support with priority tiers:
+    - High: pdf, txt, docx, doc, md, rtf, xlsx, xls, xlsm, csv
+    - Medium (commented): odt, html, htm, json, xml
+    - Low (commented): epub, pptx, ppt
 
-- **DeepSeek OCR Local Inference Hardware Assessment** (`docs/origin_doc.md`)
-  - Tested on: Intel i5-13500T, 8 GB RAM, Intel UHD 770 (2 GB VRAM)
-  - 1.3B model: Possible on CPU (~5-10 sec/page), but lower quality than Tesseract
-  - 7B+ models: Not feasible (VRAM/RAM insufficient)
-  - Recommendation: Use API instead of local inference
-
-### Documentation
-- Updated `docs/origin_doc.md` with OCR comparison and hardware assessment
-
----
-
-## [0.3.0] - 2026-09-25
-
-### Added
-- **Novita.ai DeepSeek OCR 2 Pricing Analysis** (`docs/origin_doc.md`)
-  - Actual pricing: $0.03 / 1M tokens (input + output)
-  - Cost per page: ~$0.00003–0.0001 (3–10 cents per 1,000 pages)
-  - 500–1,000 pages = $0.015–0.10 total (vs previous $0.50–5.00 estimate)
-  - Hardware constraints now irrelevant for API usage
+- **Extension Scanner** (`scripts/scan_extensions.py`)
+  - Reads `docs_source` from config.yaml
+  - Recursive scan with extension counting
+  - Found: 994 pdf, 26 docx, 6 txt, 4 doc, 3 xlsx, 2 xls, 1 xlsm, 2 rar, 2 zip, 1 db
 
 ### Changed
-- Updated cost estimates and recommendations in `docs/origin_doc.md`
-- API-based OCR now recommended as viable for full corpus
-
----
-
-## [0.4.0] - 2026-09-25
-
-### Added
-- **KERC Folder Inventory** (`docs/kerc_folder_inventory.md`)
-  - Complete scan: 994 PDFs, 25,453 pages
-  - Breakdown by category (OMBUDSMAN, PRINT MERGED, WBESCL, KERC, BESR, CEA, etc.)
-  - Largest individual PDFs identified (500+ page merged manuals)
-  - Deduplication analysis: ~50% duplicates, ~12,000 unique pages
-
-- **Cost Projections**
-  - All pages via Novita.ai: $0.76–2.30
-  - Deduplicated: $0.36–1.10
-  - Core KERC only: $0.09–0.27
-
-### Documentation
-- `docs/kerc_folder_inventory.md` with full breakdown
+- Refactored deduplication script to use `config.yaml`
+- Removed hardcoded paths and file types
+- Deleted legacy `config.json`
 
 ---
 
@@ -116,42 +79,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.6.0] - 2026-09-25
+## [0.4.0] - 2026-09-25
 
 ### Added
-- **Configuration System** (`config.yaml`)
-  - YAML-based config (replaced JSON)
-  - Multi-source support: `docs_source` as list of folders
-  - Multi-filetype support with priority tiers:
-    - High: pdf, txt, docx, doc, md, rtf, xlsx, xls, xlsm, csv
-    - Medium (commented): odt, html, htm, json, xml
-    - Low (commented): epub, pptx, ppt
+- **KERC Folder Inventory** (`docs/kerc_folder_inventory.md`)
+  - Complete scan: 994 PDFs, 25,453 pages
+  - Breakdown by category (OMBUDSMAN, PRINT MERGED, WBESCL, KERC, BESR, CEA, etc.)
+  - Largest individual PDFs identified (500+ page merged manuals)
+  - Deduplication analysis: ~50% duplicates, ~12,000 unique pages
 
-- **Extension Scanner** (`scripts/scan_extensions.py`)
-  - Reads `docs_source` from config.yaml
-  - Recursive scan with extension counting
-  - Found: 994 pdf, 26 docx, 6 txt, 4 doc, 3 xlsx, 2 xls, 1 xlsm, 2 rar, 2 zip, 1 db
+- **Cost Projections**
+  - All pages via Novita.ai: $0.76–2.30
+  - Deduplicated: $0.36–1.10
+  - Core KERC only: $0.09–0.27
 
-### Changed
-- Refactored deduplication script to use `config.yaml`
-- Removed hardcoded paths and file types
-- Deleted legacy `config.json`
+### Documentation
+- `docs/kerc_folder_inventory.md` with full breakdown
 
 ---
 
-## [0.7.0] - 2026-09-25
+## [0.3.0] - 2026-09-25
 
 ### Added
-- **Incremental Update Strategy** (`docs/incremental_update_strategy.md`)
-  - Problem statement: handling edits, additions, new subfolders, moves after initial indexing
-  - Manifest-based approach: `docs/file_manifest.json` tracking path, hash, mtime, chunks
-  - Change classification: NEW, MODIFIED, MOVED, DELETED, UNCHANGED
-  - Per-component incremental strategies (dedup, OCR, chunking, embeddings, vector DB)
-  - ChromaDB operations for each change type (upsert, delete, update metadata)
-  - Three implementation options with recommendation (custom manifest for control)
+- **Novita.ai DeepSeek OCR 2 Pricing Analysis** (`docs/origin_doc.md`)
+  - Actual pricing: $0.03 / 1M tokens (input + output)
+  - Cost per page: ~$0.00003–0.0001 (3–10 cents per 1,000 pages)
+  - 500–1,000 pages = $0.015–0.10 total (vs previous $0.50–5.00 estimate)
+  - Hardware constraints now irrelevant for API usage
+
+### Changed
+- Updated cost estimates and recommendations in `docs/origin_doc.md`
+- API-based OCR now recommended as viable for full corpus
+
+---
+
+## [0.2.0] - 2026-09-25
+
+### Added
+- **Tesseract vs DeepSeek OCR Comparison** (`docs/origin_doc.md`)
+  - Detailed accuracy comparison by document type (clean text, tables, handwriting, multi-column, formulas)
+  - KERC-specific assessment: government orders, tariff tables, Kannada/English mixed, rule numbering
+  - Hybrid approach recommendation: 90% Tesseract + 10% DeepSeek OCR API
+
+- **DeepSeek OCR Local Inference Hardware Assessment** (`docs/origin_doc.md`)
+  - Tested on: Intel i5-13500T, 8 GB RAM, Intel UHD 770 (2 GB VRAM)
+  - 1.3B model: Possible on CPU (~5-10 sec/page), but lower quality than Tesseract
+  - 7B+ models: Not feasible (VRAM/RAM insufficient)
+  - Recommendation: Use API instead of local inference
 
 ### Documentation
-- Complete incremental strategy document with code examples
+- Updated `docs/origin_doc.md` with OCR comparison and hardware assessment
+
+---
+
+## [0.1.0] - 2026-09-25
+
+### Added
+- **Initial RAG Architecture** (`docs/origin_doc.md`)
+  - Local-first RAG pipeline design for KERC regulatory documents
+  - Architecture: PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector DB → LLM Query → Cited Answers
+  - Stack: ChromaDB, sentence-transformers, Ollama/Claude API, pdfplumber, LangChain/LlamaIndex
+
+- **OCR Engine Integration**
+  - Tesseract via `pytesseract` and `ocrmypdf` for searchable PDF layer
+  - Fallback strategy: pdfplumber first, OCR only for low-text pages
+  - Dependencies documented for Windows installation
+
+- **Option A vs Option B Comparison**
+  - Option A: Custom Python prototype (full control, legal-aware chunking, custom citations)
+  - Option B: Existing tools (AnythingLLM, Kotaemon, PrivateGPT)
+  - Decision matrix for choosing based on priorities
+
+### Documentation
+- `docs/origin_doc.md` — Complete architecture and comparison document
 
 ---
 
