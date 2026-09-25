@@ -12,8 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Planned
 - Build RAG query interface (CLI + Gradio UI) with citation support
 - Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)
-- Add spreadsheet extraction (xlsx/xls/xlsm/csv) so those files stop reporting `unsupported`
 - Signature-based move detection for renames that also edit content (now a hint only)
+
+---
+
+## [0.11.0] - 2026-09-25
+
+### Added
+- **`--audit` mode** — extracts and chunks the corpus to report `needs_ocr`, `empty` and
+  `unsupported` volumes *before* paying for a full ingest, and writes nothing: no manifest, no
+  embeddings, no vector store. The summary gains a "Would index / Pages with no text layer" block
+  so the OCR workload can be sized ahead of the ingestion run
+- Tests for audit mode (nothing written even with the embedding stack installed, and it works
+  with the embedding dependencies missing)
 
 ---
 

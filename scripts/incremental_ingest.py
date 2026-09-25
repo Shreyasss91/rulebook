@@ -657,7 +657,8 @@ def move_chunks(collection, old_path: str, new_path: str, root: str) -> int:
 # --------------------------------------------------------------------------
 
 def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
-                            collection, can_embed: bool) -> tuple[str, int, str | None]:
+                            collection, can_embed: bool,
+                            embed_note: str | None = None) -> tuple[str, int, str | None]:
     """Extract -> chunk -> embed -> upsert one NEW/MODIFIED file."""
     rel = change["path"]
     entry = change["entry"]
@@ -703,7 +704,8 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
     if not can_embed or collection is None:
         # Chunks are already built, so the next run with the deps installed only
         # has to embed them - the chunk_count is recorded as computed.
-        return PENDING_EMBEDDING, len(chunks), "sentence-transformers/chromadb not installed"
+        return PENDING_EMBEDDING, len(chunks), embed_note or (
+            "sentence-transformers/chromadb not installed")
 
     indexed = index_chunks(collection, embedder, rel, entry["root"], path, chunks,
                            entry["content_hash"])
@@ -711,7 +713,8 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
 
 
 def apply_one_change(change: dict, config: dict, previous: dict, current: dict, stats: dict,
-                     embedder: Embedder, collection, can_embed: bool, verbose: bool) -> None:
+                     embedder: Embedder, collection, can_embed: bool, verbose: bool,
+                     embed_note: str | None = None) -> None:
     """Apply a single classified change, updating `current` and `stats` in place."""
     kind = change["type"]
     rel = change["path"]
@@ -763,7 +766,7 @@ def apply_one_change(change: dict, config: dict, previous: dict, current: dict, 
         return
 
     status, chunk_count, note = process_new_or_modified(
-        {"path": rel, "entry": entry}, config, embedder, collection, can_embed)
+        {"path": rel, "entry": entry}, config, embedder, collection, can_embed, embed_note)
     entry["status"] = status
     entry["last_processed"] = now
     entry["chunk_count"] = chunk_count
@@ -788,31 +791,37 @@ def apply_one_change(change: dict, config: dict, previous: dict, current: dict, 
 
 
 def apply_changes(changes: list[dict], config: dict, previous: dict, current: dict,
-                  dry_run: bool, can_embed: bool, verbose: bool,
-                  save_cb=None) -> dict:
+                  can_embed: bool, verbose: bool, write: bool, extract: bool,
+                  save_cb=None, embed_note: str | None = None) -> dict:
     """
-    Apply every change. `save_cb` (when given) is called every `batch_size`
-    changes so an interrupted run on the full corpus keeps its progress.
+    Apply every change.
+
+    `write`    - False keeps the manifest and the vector store untouched.
+    `extract`  - False only classifies (the cheap `--dry-run`); True runs extraction
+                 and chunking, which is what `--audit` uses to measure the text
+                 layer without embedding anything.
+    `save_cb`  - called every `batch_size` changes, so an interrupted run on the
+                 full corpus keeps its progress.
     """
     stats = defaultdict(int)
     embedder = Embedder(config)
-    collection = None if dry_run else open_collection(config)
+    collection = None if not write else open_collection(config)
     save_every = config.get("batch_size", 100)
     pending = sum(1 for change in changes if change["type"] != UNCHANGED)
     processed = 0
 
     for change in changes:
-        if dry_run and change["type"] in (NEW, MODIFIED, DELETED):
+        if not extract and change["type"] in (NEW, MODIFIED, DELETED):
             # Nothing to apply; planned actions are listed in the summary below.
             stats[change["type"]] += 1
             continue
 
-        # UNCHANGED and MOVED still go through in dry-run: the log line and the
-        # "moved but never indexed" reclassification belong in the report.
+        # UNCHANGED and MOVED always go through: the log line and the "moved but
+        # never indexed" reclassification belong in the report.
         apply_one_change(change, config, previous, current, stats, embedder,
-                         collection, can_embed, verbose)
+                         collection, can_embed, verbose, embed_note)
 
-        if dry_run or change["type"] == UNCHANGED:
+        if not write or change["type"] == UNCHANGED:
             continue
         processed += 1
         if save_every and processed % save_every == 0:
@@ -826,6 +835,25 @@ def apply_changes(changes: list[dict], config: dict, previous: dict, current: di
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def report_not_indexed(current: dict) -> None:
+    """Print the files that are in the manifest but not in the collection, by status."""
+    not_indexed: dict[str, list[str]] = defaultdict(list)
+    for rel, entry in sorted(current.items()):
+        status = entry.get("status")
+        if status and status != INDEXED:
+            not_indexed[status].append(rel)
+    if not not_indexed:
+        return
+    print("Not indexed: " + ", ".join(f"{len(paths)} {status}"
+                                      for status, paths in not_indexed.items()))
+    for status, paths in not_indexed.items():
+        for rel in paths[:5]:
+            note = current[rel].get("note", "")
+            print(f"  - {rel} ({status}{': ' + note if note else ''})")
+        if len(paths) > 5:
+            print(f"  - ... and {len(paths) - 5} more {status}")
+
 
 def report_warnings(scan_stats: dict, current: dict, changes: list[dict]) -> None:
     """Surface the situations that need a human eye, not just a status change."""
@@ -898,6 +926,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="override chroma_path from config")
     parser.add_argument("--dry-run", action="store_true",
                         help="classify and report changes without writing anything")
+    parser.add_argument("--audit", action="store_true",
+                        help="like --dry-run but also extracts and chunks, so needs_ocr, "
+                             "empty and unsupported volumes can be measured; writes nothing")
     parser.add_argument("--full-hash", action="store_true",
                         help="re-hash every file instead of trusting size+mtime")
     parser.add_argument("--strict", action="store_true",
@@ -925,7 +956,10 @@ def main(argv: list[str] | None = None) -> int:
     current, scan_stats = scan_sources(config, previous, args.full_hash)
     scan_stats["sources_overridden"] = bool(args.source)
 
-    can_embed = Embedder.available() and chromadb is not None
+    # --audit extracts text but never embeds: that is what makes it read-only.
+    write = not (args.dry_run or args.audit)
+    extract = write or args.audit
+    can_embed = write and Embedder.available() and chromadb is not None
 
     changes = classify(current, previous, config, can_embed)
 
@@ -933,10 +967,12 @@ def main(argv: list[str] | None = None) -> int:
         save_manifest(manifest_path, current, {"scanned": scan_stats["scanned"],
                                               "ignored": scan_stats["ignored"]})
 
-    stats = apply_changes(changes, config, previous, current, args.dry_run, can_embed,
-                          args.verbose, save_cb=None if args.dry_run else save_now)
+    stats = apply_changes(changes, config, previous, current, can_embed,
+                          args.verbose, write=write, extract=extract,
+                          save_cb=save_now if write else None,
+                          embed_note="--audit: extraction only, not indexed" if args.audit else None)
 
-    if not args.dry_run:
+    if write:
         # Final save; apply_changes also saved every batch_size changes.
         save_now()
 
@@ -946,29 +982,31 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Scanned {scan_stats['scanned']} files ({scan_stats['ignored']} skipped via dedup ignore list, "
           f"{scan_stats['hashed']} hashed)")
     print("Changes: " + ", ".join(f"{counts[k]} {k}" for k in counts))
-    if not can_embed:
+    if write and not can_embed:
         print("Mode: manifest-only (sentence-transformers/chromadb unavailable)")
+    if args.audit:
+        print("Mode: audit (--audit) - extracted, chunked, nothing written")
     report_warnings(scan_stats, current, changes)
-    if not args.dry_run:
+
+    if write:
         print(f"Indexed: {stats.get('chunks_indexed', 0)} chunks"
               + (f", re-labelled {stats['chunks_moved']}" if stats.get("chunks_moved") else ""))
         if stats.get("chunks_pending"):
             print(f"Chunked but not indexed: {stats['chunks_pending']} chunks")
-        not_indexed: dict[str, list[str]] = defaultdict(list)
-        for rel, entry in sorted(current.items()):
-            status = entry.get("status")
-            if status and status != INDEXED:
-                not_indexed[status].append(rel)
-        if not_indexed:
-            print("Not indexed: " + ", ".join(f"{len(paths)} {status}"
-                                              for status, paths in not_indexed.items()))
-            for status, paths in not_indexed.items():
-                for rel in paths[:5]:
-                    note = current[rel].get("note", "")
-                    print(f"  - {rel} ({status}{': ' + note if note else ''})")
-                if len(paths) > 5:
-                    print(f"  - ... and {len(paths) - 5} more {status}")
+        report_not_indexed(current)
         print(f"Manifest: {manifest_path}")
+    elif extract:
+        would_index = [rel for rel, entry in sorted(current.items())
+                       if entry.get("status") == PENDING_EMBEDDING]
+        pages = sum(entry.get("page_count") or 0 for entry in current.values())
+        no_text = sum(entry.get("pages_without_text") or 0 for entry in current.values())
+        print(f"Would index: {len(would_index)} file(s), {stats.get('chunks_pending', 0)} chunks "
+              f"from {pages} page(s)")
+        if no_text:
+            print(f"Pages with no text layer: {no_text} "
+                  f"({no_text / max(pages, 1):.0%} of extracted pages)")
+        report_not_indexed(current)
+        print("Audit: nothing written")
     else:
         print("Dry run: nothing written")
         for change in changes:

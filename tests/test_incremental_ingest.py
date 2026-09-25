@@ -550,6 +550,37 @@ def test_case_only_rename_is_a_move(tmp_path, store):
     assert collection.sources() == {"rule14.txt"}
 
 
+def test_audit_extracts_and_reports_without_writing(tmp_path, store, capsys, monkeypatch):
+    collection, counters = store
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body(), "scan.pdf": "x"})
+    config = write_config(tmp_path, corpus)
+    monkeypatch.setattr(ingest, "extract_pages", lambda path, config: (
+        ([{"page": 1, "text": ""}] if path.suffix == ".pdf"
+         else [{"page": None, "text": body()}]), None))
+
+    assert run(config, "--audit") == 0
+
+    assert collection.count() == 0, "audit must not write to the vector store"
+    assert counters["embedded"] == 0, "audit must not embed"
+    assert not (config.parent / "manifest.json").exists(), "audit must not write a manifest"
+    out = capsys.readouterr().out
+    assert "Mode: audit" in out
+    assert "Would index: 1 file(s)" in out
+    assert "needs_ocr" in out
+    assert "Audit: nothing written" in out
+
+
+def test_audit_can_run_without_embedding_dependencies(tmp_path, no_deps, capsys):
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})
+    config = write_config(tmp_path, corpus)
+
+    assert run(config, "--audit") == 0
+
+    out = capsys.readouterr().out
+    assert "Would index: 1 file(s)" in out
+    assert "extraction only" in out
+
+
 def test_offline_source_does_not_wipe_the_collection(tmp_path, store, capsys):
     collection, _ = store
     corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})

@@ -80,6 +80,10 @@ python scripts/create_deduplication_ignore_list_v2.py
 # Incremental ingest: report changes without writing anything
 python scripts/incremental_ingest.py --dry-run -v
 
+# Incremental ingest: measure what extraction would produce (needs_ocr, empty,
+# unsupported counts) without embedding or writing anything
+python scripts/incremental_ingest.py --audit
+
 # Incremental ingest: apply them
 python scripts/incremental_ingest.py
 
@@ -90,6 +94,14 @@ python -m pytest
 `create_deduplication_ignore_list_v2.py` imports `pdfplumber` and `python-docx` optionally: PDFs are skipped if pdfplumber is missing. It is resumable via `docs/deduplication_progress.json` and processes `batch_size` files per batch.
 
 `incremental_ingest.py` also accepts `--full-hash` (re-hash everything instead of trusting size+mtime), `--strict` (exit 2 when files are left blocked, for cron), and `--source`/`--manifest`/`--chroma-path` overrides for testing against a scratch corpus.
+
+Three read-only-ish modes, from cheapest to most thorough:
+
+| Mode | Reads | Writes | Use it to |
+|------|-------|--------|-----------|
+| `--dry-run` | hashes changed files | nothing | see which files are NEW/MODIFIED/MOVED/DELETED |
+| `--audit` | + extracts and chunks | nothing | size the OCR/unsupported workload before a full run |
+| default | + embeds | manifest + ChromaDB | actually ingest |
 
 ## Tests
 
