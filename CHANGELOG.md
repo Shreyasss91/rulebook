@@ -10,9 +10,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Implement incremental ingestion script (`scripts/incremental_ingest.py`) with manifest-based change detection
 - Build RAG query interface (CLI + Gradio UI) with citation support
 - Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)
+- Add spreadsheet extraction (xlsx/xls/xlsm/csv) so those files stop reporting `unsupported`
+
+---
+
+## [0.9.0] - 2026-09-25
+
+### Added
+- **Incremental Ingestion** (`scripts/incremental_ingest.py`) — Option A from `docs/incremental_update_strategy.md`
+  - Manifest (`docs/file_manifest.json`, gitignored) records size, mtime, SHA256 `content_hash`, dedup signature, page count, chunk count and status per file
+  - Change classification: NEW, MODIFIED, MOVED (same hash at a new path), DELETED, UNCHANGED
+  - Vector DB operations: upsert for NEW/MODIFIED, metadata re-label for MOVED (no re-embedding),
+    delete by source for DELETED
+  - Legal-aware chunking keeps rule/section headings attached to their chunk; chunks never span
+    pages, so citations carry an exact page number
+  - Chunk ids derived as `sha1("<rel_path>|<content_hash>|<index>")`, so the manifest stores a count
+    rather than every id
+  - Degrades gracefully: without sentence-transformers/chromadb it still extracts, chunks and
+    updates the manifest, marking files `pending_embedding` for a later run
+  - Statuses: `indexed`, `needs_ocr`, `pending_embedding`, `unsupported`, `empty`, `error`;
+    retryable ones are re-processed automatically once the blocking capability exists
+  - CLI: `--dry-run`, `--full-hash`, `--strict` (exit 2 for cron), `--source`/`--manifest`/`--chroma-path` overrides
+  - Size+mtime fast path avoids re-hashing unchanged files on every run
+
+### Changed
+- `config.yaml` gained incremental ingest settings: `manifest_path`, `track_moves`,
+  `track_deletions`, chunking (`chunk_size`, `chunk_overlap`, `min_chunk_chars`),
+  embeddings/vector store (`embedding_model`, `embedding_batch_size`, `chroma_path`,
+  `collection_name`) and `ocr_min_chars_per_page`
+- `requirements.txt`: sentence-transformers/chromadb relabelled from "planned" to optional, since
+  the script now uses them when present
+- `docs/incremental_update_strategy.md` records the implementation status and where the built
+  script deviates from the original sketch
+
+### Verified
+- Scratch corpus run covering all four documented scenarios: new file, new subfolder, edit, move,
+  delete — plus idempotent rerun, dry run (writes nothing) and a run with embeddings/chromadb
+  unavailable followed by a successful retry
 
 ---
 
@@ -206,8 +242,8 @@ rule_books/
 ├── scripts/
 │   ├── create_deduplication_ignore_list_v2.py
 │   ├── scan_extensions.py
-│   └── (planned) incremental_ingest.py
-└── (planned) kerch_db/            # ChromaDB vector store (gitignored)
+│   └── incremental_ingest.py      # Manifest diff + extract/chunk/embed/upsert
+└── kerch_db/                      # ChromaDB vector store (gitignored, created on first run)
 ```
 
 ---
@@ -216,9 +252,9 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 17 |
+| **Commits** | 18 |
 | **Documents** | 6 markdown files (4 in `docs/`, 2 at root) |
-| **Scripts** | 2 Python scripts |
+| **Scripts** | 3 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
 | **Est. OCR Cost** | $0.36–1.10 (deduplicated, via Novita.ai) |
@@ -230,7 +266,6 @@ rule_books/
 
 | Milestone | Target |
 |-----------|--------|
-| Incremental ingestion script | v0.9.0 |
 | RAG query CLI | v1.0.0 |
 | Gradio UI with citations | v1.1.0 |
 | Scheduled auto-ingest | v1.2.0 |

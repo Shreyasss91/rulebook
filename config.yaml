@@ -33,3 +33,23 @@ ignore_list_path: "docs/deduplication_ignore_list.json"
 progress_path: "docs/deduplication_progress.json"
 batch_size: 100
 signature_prefix_chars: 300
+
+# --- Incremental update settings (scripts/incremental_ingest.py) ---------
+manifest_path: "docs/file_manifest.json"
+track_moves: true          # same content_hash at a new path = MOVED, not NEW+DELETED
+track_deletions: true      # drop chunks for files that disappeared
+
+# Chunking — legal-aware, so rule/section numbering stays intact
+chunk_size: 1200           # target characters per chunk
+chunk_overlap: 200         # characters carried from the previous chunk
+min_chunk_chars: 200       # shorter chunks are merged into their neighbour
+
+# Embeddings + vector store (sentence-transformers / chromadb must be installed)
+embedding_model: "all-MiniLM-L6-v2"
+embedding_batch_size: 32
+chroma_path: "kerch_db"
+collection_name: "kerc_docs"
+
+# OCR fallback trigger: PDFs below this many characters per page are considered
+# to have no text layer, and are marked needs_ocr instead of indexed.
+ocr_min_chars_per_page: 50

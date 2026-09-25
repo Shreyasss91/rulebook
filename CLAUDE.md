@@ -41,10 +41,10 @@ rule_books/
 └── scripts/
     ├── scan_extensions.py
     ├── create_deduplication_ignore_list_v2.py
-    └── (planned) incremental_ingest.py
+    └── incremental_ingest.py                 # manifest-based change detection + indexing
 ```
 
-Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `docs/file_manifest.json` (planned).
+Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `docs/file_manifest.json`.
 
 ## Key Files
 
@@ -53,6 +53,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `config.yaml` | Central config: `docs_source` (list), `file_types` (priority tiers), ignore list, progress, batch size |
 | `scripts/create_deduplication_ignore_list_v2.py` | Content-based deduplication (size + first/last page hash) → `docs/deduplication_ignore_list.json` |
 | `scripts/scan_extensions.py` | Recursive scan of `docs_source` for extension counts |
+| `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → chunk → embed → ChromaDB upsert |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
 | `docs/kerc_folder_inventory.md` | Corpus scan: 994 PDFs, 25K pages, category breakdown, cost projections |
@@ -75,9 +76,17 @@ python scripts/scan_extensions.py
 
 # Run deduplication (creates/updates ignore list)
 python scripts/create_deduplication_ignore_list_v2.py
+
+# Incremental ingest: report changes without writing anything
+python scripts/incremental_ingest.py --dry-run -v
+
+# Incremental ingest: apply them
+python scripts/incremental_ingest.py
 ```
 
 `create_deduplication_ignore_list_v2.py` imports `pdfplumber` and `python-docx` optionally: PDFs are skipped if pdfplumber is missing. It is resumable via `docs/deduplication_progress.json` and processes `batch_size` files per batch.
+
+`incremental_ingest.py` also accepts `--full-hash` (re-hash everything instead of trusting size+mtime), `--strict` (exit 2 when files are left blocked, for cron), and `--source`/`--manifest`/`--chroma-path` overrides for testing against a scratch corpus.
 
 ## Config Structure (`config.yaml`)
 
@@ -113,12 +122,29 @@ signature_prefix_chars: 300
 - **Progress file**: `docs/deduplication_progress.json` (resume capability, gitignored)
 - **Result**: 994 PDFs → 939 unique (55 duplicates: blank pages, cross-folder copies, print vs source)
 
-## Incremental Update Strategy (Planned)
+## Incremental Ingestion
 
-Manifest-based (`docs/file_manifest.json`) tracking:
-- `content_hash` (SHA256) for change detection
-- Change types: NEW, MODIFIED, MOVED (same hash, diff path), DELETED, UNCHANGED
-- ChromaDB ops: `upsert` (NEW/MODIFIED), `delete` (DELETED), `update` metadata (MOVED)
+`scripts/incremental_ingest.py` implements the strategy in `docs/incremental_update_strategy.md`.
+The manifest (`docs/file_manifest.json`, gitignored) tracks size, mtime, SHA256 `content_hash`,
+dedup signature, page count, chunk count and status per file. Per change type:
+
+| Type | Detection | Action |
+|------|-----------|--------|
+| NEW | path not in manifest | extract → chunk → embed → upsert |
+| MODIFIED | same path, different hash | re-extract, delete old chunks, upsert new ones |
+| MOVED | same hash, new path | rewrite chunk metadata only — no re-embedding |
+| DELETED | path gone from manifest | delete that source's chunks |
+| UNCHANGED | same hash, status settled | skipped |
+
+- Statuses: `indexed`, `needs_ocr`, `pending_embedding`, `unsupported`, `empty`, `error`.
+  Anything left in a retryable status is picked up automatically on a later run once the
+  missing capability exists (flip `OCR_AVAILABLE` in the script when OCR lands).
+- Chunk ids are derived as `sha1("<rel_path>|<content_hash>|<index>")`, so the manifest stores only
+  `chunk_count` instead of every id, and chunks are still pruned/updated by metadata filters.
+- Chunks never span pages, so citations keep an exact page number; `.txt`/`.md`/`.docx` have
+  no pages and record `page = -1`.
+- Without `sentence-transformers`/`chromadb` the run still extracts, chunks and updates the
+  manifest (files land in `pending_embedding`); it never blocks on the heavy dependencies.
 
 ## Conventions
 
@@ -142,7 +168,6 @@ Manifest-based (`docs/file_manifest.json`) tracking:
 
 | Milestone | Version |
 |-----------|---------|
-| `scripts/incremental_ingest.py` — manifest-based change detection | v0.9.0 |
 | RAG query CLI with citation support | v1.0.0 |
 | Gradio UI with citations | v1.1.0 |
 | OCR pipeline integration (Tesseract + Novita.ai hybrid) | — |

@@ -14,8 +14,11 @@ pyyaml>=6.0                # config.yaml loading (scan_extensions.py, dedup scri
 pdfplumber>=0.11.0         # PDF text extraction for content signatures
 python-docx>=1.1.0         # .docx text extraction for content signatures
 
-# --- Planned: RAG pipeline ----------------------------------------------
-# Uncomment when scripts/incremental_ingest.py and the query CLI land.
+# --- Optional: turns on the indexing stage of incremental_ingest.py ------
+# Without these the script still detects changes, extracts and chunks text, and
+# updates the manifest - files just stop at status "pending_embedding" and are
+# picked up by the next run that has them. Left out of the default install
+# because sentence-transformers pulls in PyTorch (~2 GB).
 # sentence-transformers>=2.7.0   # all-MiniLM-L6-v2 embeddings (local, CPU)
 # chromadb>=0.4.24               # persistent local vector store (kerch_db/)
 

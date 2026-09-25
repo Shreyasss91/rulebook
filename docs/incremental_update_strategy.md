@@ -154,17 +154,32 @@ collection.update(
 
 ---
 
+## Implementation Status: Done (Option A)
+
+`scripts/incremental_ingest.py` implements everything above. Deviations from the
+sketch in this document, and why:
+
+| Sketch | Implementation | Why |
+|--------|----------------|-----|
+| `chunk_ids: [...]` stored in the manifest | `chunk_count` only; ids derived as `sha1("<rel_path>\|<content_hash>\|<index>")` | A full corpus would put ~190k ids in the manifest; ids stay deterministic and the collection is pruned by metadata filters instead |
+| Hash only for change detection | size+mtime fast path, SHA256 when either differs, `--full-hash` to override | Avoids re-reading 25k pages on every run |
+| OCR skips on `mtime` + `has_text_layer` | PDFs below `ocr_min_chars_per_page` are marked `needs_ocr` and retried once `OCR_AVAILABLE` is flipped in the script | OCR is not built yet, so retrying today would just repeat the same failure |
+| `process_new_file` etc. as separate steps | Single `process_new_or_modified` that degrades to `pending_embedding` when sentence-transformers/chromadb are absent | Lets the manifest stage be used before the RAG stack is installed |
+| Move = metadata update | Same, plus: a move of a file that was never indexed is reprocessed instead | Re-labelling zero chunks would silently lose the file |
+
+Ignore-list entries are matched on the path relative to their source root (the same
+convention `create_deduplication_ignore_list_v2.py` writes). With more than one entry in
+`docs_source`, an entry can therefore match a file in each source — keep ignore-list paths
+unique, or run one source at a time.
+
 ## Next Steps
 
-1. Create `scripts/incremental_ingest.py` with manifest logic
-2. Add `file_manifest.json` to `.gitignore` (local only, regenerated)
-3. Integrate with existing deduplication (`deduplication_ignore_list.json`)
-4. Test all 4 scenarios:
-   - Edit file → re-index
-   - Add file → index
-   - Add subfolder → index
-   - Move file → update path, no re-embedding
-4. Schedule via cron or run manually after changes
+1. ~~Create `scripts/incremental_ingest.py` with manifest logic~~ ✅
+2. ~~Add `file_manifest.json` to `.gitignore` (local only, regenerated)~~ ✅
+3. ~~Integrate with existing deduplication (`deduplication_ignore_list.json`)~~ ✅
+4. ~~Test all 4 scenarios~~ ✅ verified on a scratch corpus: add, add-subfolder, edit, move, delete, plus rerun idempotency and dependency-less runs
+5. Add xlsx/xls/csv extraction (currently `unsupported`) and the OCR pipeline (`needs_ocr`)
+6. Schedule via cron (`--strict` exits 2 while files are blocked) or run manually after changes
 
 ---
 
