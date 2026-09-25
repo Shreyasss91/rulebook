@@ -1,0 +1,208 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [Unreleased]
+
+### Planned
+- Implement incremental ingestion script (`scripts/incremental_ingest.py`) with manifest-based change detection
+- Build RAG query interface (CLI + Gradio UI) with citation support
+- Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)
+
+---
+
+## [0.1.0] - 2026-09-25
+
+### Added
+- **Initial RAG Architecture** (`docs/origin_doc.md`)
+  - Local-first RAG pipeline design for KERC regulatory documents
+  - Architecture: PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector DB → LLM Query → Cited Answers
+  - Stack: ChromaDB, sentence-transformers, Ollama/Claude API, pdfplumber, LangChain/LlamaIndex
+
+- **OCR Engine Integration**
+  - Tesseract via `pytesseract` and `ocrmypdf` for searchable PDF layer
+  - Fallback strategy: pdfplumber first, OCR only for low-text pages
+  - Dependencies documented for Windows installation
+
+- **Option A vs Option B Comparison**
+  - Option A: Custom Python prototype (full control, legal-aware chunking, custom citations)
+  - Option B: Existing tools (AnythingLLM, Kotaemon, PrivateGPT)
+  - Decision matrix for choosing based on priorities
+
+### Documentation
+- `docs/origin_doc.md` — Complete architecture and comparison document
+
+---
+
+## [0.2.0] - 2026-09-25
+
+### Added
+- **Tesseract vs DeepSeek OCR Comparison** (`docs/origin_doc.md`)
+  - Detailed accuracy comparison by document type (clean text, tables, handwriting, multi-column, formulas)
+  - KERC-specific assessment: government orders, tariff tables, Kannada/English mixed, rule numbering
+  - Hybrid approach recommendation: 90% Tesseract + 10% DeepSeek OCR API
+
+- **DeepSeek OCR Local Inference Hardware Assessment** (`docs/origin_doc.md`)
+  - Tested on: Intel i5-13500T, 8 GB RAM, Intel UHD 770 (2 GB VRAM)
+  - 1.3B model: Possible on CPU (~5-10 sec/page), but lower quality than Tesseract
+  - 7B+ models: Not feasible (VRAM/RAM insufficient)
+  - Recommendation: Use API instead of local inference
+
+### Documentation
+- Updated `docs/origin_doc.md` with OCR comparison and hardware assessment
+
+---
+
+## [0.3.0] - 2026-09-25
+
+### Added
+- **Novita.ai DeepSeek OCR 2 Pricing Analysis** (`docs/origin_doc.md`)
+  - Actual pricing: $0.03 / 1M tokens (input + output)
+  - Cost per page: ~$0.00003–0.0001 (3–10 cents per 1,000 pages)
+  - 500–1,000 pages = $0.015–0.10 total (vs previous $0.50–5.00 estimate)
+  - Hardware constraints now irrelevant for API usage
+
+### Changed
+- Updated cost estimates and recommendations in `docs/origin_doc.md`
+- API-based OCR now recommended as viable for full corpus
+
+---
+
+## [0.4.0] - 2026-09-25
+
+### Added
+- **KERC Folder Inventory** (`docs/kerc_folder_inventory.md`)
+  - Complete scan: 994 PDFs, 25,453 pages
+  - Breakdown by category (OMBUDSMAN, PRINT MERGED, WBESCL, KERC, BESR, CEA, etc.)
+  - Largest individual PDFs identified (500+ page merged manuals)
+  - Deduplication analysis: ~50% duplicates, ~12,000 unique pages
+
+- **Cost Projections**
+  - All pages via Novita.ai: $0.76–2.30
+  - Deduplicated: $0.36–1.10
+  - Core KERC only: $0.09–0.27
+
+### Documentation
+- `docs/kerc_folder_inventory.md` with full breakdown
+
+---
+
+## [0.5.0] - 2026-09-25
+
+### Added
+- **Deduplication System** (`scripts/create_deduplication_ignore_list_v2.py`)
+  - Content-based signature (size + first/last page text hash)
+  - Resume capability via progress file
+  - Batch processing (100 files/batch)
+  - Outputs: `docs/deduplication_ignore_list.json` + `docs/deduplication_report.md`
+
+- **Results**
+  - 994 PDFs scanned → 55 duplicates found → 939 unique kept
+  - Duplicates: blank pages across years, cross-folder copies, print vs source
+  - Ignore list used by ingestion pipeline to skip duplicates
+
+### Documentation
+- `docs/deduplication_report.md` — Detailed duplicate groups
+- `docs/deduplication_ignore_list.json` — Machine-readable ignore list
+
+### Fixed
+- Added `deduplication_progress.json` to `.gitignore` (temp file)
+- Removed superseded v1 script
+
+---
+
+## [0.6.0] - 2026-09-25
+
+### Added
+- **Configuration System** (`config.yaml`)
+  - YAML-based config (replaced JSON)
+  - Multi-source support: `docs_source` as list of folders
+  - Multi-filetype support with priority tiers:
+    - High: pdf, txt, docx, doc, md, rtf, xlsx, xls, xlsm, csv
+    - Medium (commented): odt, html, htm, json, xml
+    - Low (commented): epub, pptx, ppt
+
+- **Extension Scanner** (`scripts/scan_extensions.py`)
+  - Reads `docs_source` from config.yaml
+  - Recursive scan with extension counting
+  - Found: 994 pdf, 26 docx, 6 txt, 4 doc, 3 xlsx, 2 xls, 1 xlsm, 2 rar, 2 zip, 1 db
+
+### Changed
+- Refactored deduplication script to use `config.yaml`
+- Removed hardcoded paths and file types
+- Deleted legacy `config.json`
+
+---
+
+## [0.7.0] - 2026-09-25
+
+### Added
+- **Incremental Update Strategy** (`docs/incremental_update_strategy.md`)
+  - Problem statement: handling edits, additions, new subfolders, moves after initial indexing
+  - Manifest-based approach: `docs/file_manifest.json` tracking path, hash, mtime, chunks
+  - Change classification: NEW, MODIFIED, MOVED, DELETED, UNCHANGED
+  - Per-component incremental strategies (dedup, OCR, chunking, embeddings, vector DB)
+  - ChromaDB operations for each change type (upsert, delete, update metadata)
+  - Three implementation options with recommendation (custom manifest for control)
+
+### Documentation
+- Complete incremental strategy document with code examples
+
+---
+
+## Repository Setup
+
+### Git
+- Repository: https://github.com/Shreyasss91/rulebook
+- Initial commit: a261cd3 (2026-09-25)
+- Main branch with linear history (force-pushed for clean history)
+
+### Project Structure
+```
+rule_books/
+├── config.yaml                    # Central configuration
+├── .gitignore                     # Excludes PDFs, vector DB, temp files
+├── CHANGELOG.md                   # This file
+├── docs/
+│   ├── origin_doc.md              # Main architecture & decisions
+│   ├── kerc_folder_inventory.md   # Corpus analysis
+│   ├── deduplication_report.md    # Duplicate analysis
+│   ├── deduplication_ignore_list.json
+│   ├── incremental_update_strategy.md
+│   └── file_manifest.json         # (gitignored, generated at runtime)
+├── scripts/
+│   ├── create_deduplication_ignore_list_v2.py
+│   ├── scan_extensions.py
+│   └── (planned) incremental_ingest.py
+└── (planned) kerch_db/            # ChromaDB vector store (gitignored)
+```
+
+---
+
+## Summary Statistics (as of 2026-09-25)
+
+| Metric | Value |
+|--------|-------|
+| **Commits** | 12 |
+| **Documents** | 5 markdown files in `docs/` |
+| **Scripts** | 3 Python scripts |
+| **Config** | 1 YAML file |
+| **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
+| **Est. OCR Cost** | $0.36–1.10 (deduplicated, via Novita.ai) |
+| **Unique File Types** | 10 extensions found |
+
+---
+
+## Next Milestones
+
+| Milestone | Target |
+|-----------|--------|
+| Incremental ingestion script | v0.8.0 |
+| RAG query CLI | v0.9.0 |
+| Gradio UI with citations | v1.0.0 |
+| Scheduled auto-ingest | v1.1.0 |
