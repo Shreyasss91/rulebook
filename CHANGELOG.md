@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the OCR workload can be sized ahead of the ingestion run
 - Tests for audit mode (nothing written even with the embedding stack installed, and it works
   with the embedding dependencies missing)
+- **Spreadsheet extraction** — `.xlsx`/`.xlsm` via `openpyxl`, legacy `.xls` via `xlrd`, `.csv` via
+  the standard library, replacing the `unsupported` status for the 6 spreadsheets in the corpus
+  - one page per worksheet, cited by sheet name: the sheet title becomes the chunk `section`,
+    since sheets have no page numbers (`page = -1`, like other paged-less formats)
+  - `spreadsheet_max_rows` (default 5000) caps rows per sheet, and the drop is recorded in the
+    file's `note`, so a 20k-row tariff sheet cannot turn into one enormous embedding batch
+  - tests for csv rendering and the row cap, xlsx sheet/label handling, the xls path through a
+    stubbed xlrd, both missing-library messages, and an end-to-end sheet-name citation
+
+### Changed
+- `requirements.txt`: `openpyxl` and `xlrd` added to the extraction block (both are required for
+  their formats; the script reports `unsupported` with the reason if they are absent)
+- `config.yaml`: `spreadsheet_max_rows` setting
 
 ---
 

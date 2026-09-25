@@ -153,6 +153,12 @@ def test_split_into_blocks_recognises_headings():
     assert "Rule 2.1 Fees" in headings
 
 
+def test_chunk_text_uses_the_label_when_there_is_no_heading():
+    chunks = ingest.chunk_text("row one\nrow two\n" + "cell " * 60, "Tariff 2024",
+                               {"chunk_size": 300, "chunk_overlap": 50, "min_chunk_chars": 50})
+    assert chunks and all(chunk["section"] == "Tariff 2024" for chunk in chunks)
+
+
 def test_chunk_text_keeps_heading_with_content():
     chunks = ingest.chunk_text("SECTION 1. Scope\n\n" + "word " * 200, None,
                                {"chunk_size": 300, "chunk_overlap": 50, "min_chunk_chars": 50})
@@ -199,15 +205,148 @@ def test_extract_pages_reads_text_files(tmp_path):
 
 
 def test_extract_pages_reports_unsupported_format(tmp_path):
-    path = tmp_path / "a.csv"
-    path.write_text("a,b", encoding="utf-8")
+    # .doc still needs antiword/libreoffice; the corpus holds four of them.
+    path = tmp_path / "a.doc"
+    path.write_text("binary-ish", encoding="utf-8")
     pages, error = ingest.extract_pages(path, {})
     assert pages is None
     assert "not implemented" in error
 
 
+# --------------------------------------------------------------------------
+# Spreadsheets
+# --------------------------------------------------------------------------
+
+def test_extract_csv_renders_rows_and_skips_blank_lines(tmp_path):
+    path = tmp_path / "tariff.csv"
+    path.write_text("head,value\n\n2023,45.6\n,\n2024,48.1\n", encoding="utf-8")
+
+    pages, note = ingest.extract_pages(path, {})
+
+    assert note is None
+    assert pages == [{"page": None, "label": None,
+                      "text": "head | value\n2023 | 45.6\n2024 | 48.1"}]
+
+
+def test_extract_csv_respects_row_cap(tmp_path):
+    path = tmp_path / "big.csv"
+    path.write_text("\n".join(f"row{index},x" for index in range(20)), encoding="utf-8")
+
+    pages, note = ingest.extract_pages(path, {"spreadsheet_max_rows": 5})
+
+    assert len(pages[0]["text"].splitlines()) == 5
+    assert "first 5 rows kept, 15 dropped" in note
+
+
+def test_extract_xlsx_uses_one_page_per_sheet(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    path = tmp_path / "tariff.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Tariff 2024"
+    sheet.append(["Sl no", "Rate"])
+    sheet.append([1, 4.25])
+    second = workbook.create_sheet("True-up")
+    second.append(["FY", "Amount"])
+    workbook.save(path)
+
+    pages, note = ingest.extract_pages(path, {})
+
+    assert note is None
+    assert [page["label"] for page in pages] == ["Tariff 2024", "True-up"]
+    assert pages[0]["text"] == "Sl no | Rate\n1 | 4.25"
+    assert all(page["page"] is None for page in pages)
+
+
+def test_extract_xlsx_without_openpyxl_is_unsupported(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest, "openpyxl", None)
+    path = tmp_path / "a.xlsx"
+    path.write_text("not really a workbook", encoding="utf-8")
+
+    pages, error = ingest.extract_pages(path, {})
+
+    assert pages is None
+    assert "openpyxl not installed" in error
+
+
+def test_extract_xls_without_xlrd_is_unsupported(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest, "xlrd", None)
+    path = tmp_path / "legacy.xls"
+    path.write_text("not really a workbook", encoding="utf-8")
+
+    pages, error = ingest.extract_pages(path, {})
+
+    assert pages is None
+    assert "xlrd not installed" in error
+
+
+def test_extract_xls_reads_sheets_through_xlrd(tmp_path, monkeypatch):
+    class FakeSheet:
+        def __init__(self, name, rows):
+            self.name, self._rows = name, rows
+
+        @property
+        def nrows(self):
+            return len(self._rows)
+
+        def row_values(self, index):
+            return self._rows[index]
+
+    class FakeWorkbook:
+        def __init__(self):
+            self._sheets = [FakeSheet("Sheet1", [["a", "b"], [1, 2]]),
+                            FakeSheet("Empty", [[None, ""]])]
+
+        def sheet_names(self):
+            return [sheet.name for sheet in self._sheets]
+
+        def sheet_by_name(self, name):
+            return next(sheet for sheet in self._sheets if sheet.name == name)
+
+        def release_resources(self):
+            self.released = True
+
+    monkeypatch.setattr(ingest, "xlrd", types.SimpleNamespace(open_workbook=lambda *a, **k: FakeWorkbook()))
+    path = tmp_path / "legacy.xls"
+    path.write_text("stub", encoding="utf-8")
+
+    pages, note = ingest.extract_pages(path, {})
+
+    assert note is None
+    assert [(page["label"], page["text"]) for page in pages] == [("Sheet1", "a | b\n1 | 2")]
+
+
+def test_spreadsheet_sheet_name_becomes_the_chunk_section(tmp_path, store):
+    collection, _ = store
+    openpyxl = pytest.importorskip("openpyxl")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Tariff 2024"
+    sheet.append(["Sl no", "Particulars"])
+    for row in range(1, 40):
+        sheet.append([row, "Tariff schedule line " * 6])
+    workbook.save(corpus / "tariff.xlsx")
+    config = write_config(tmp_path, corpus, file_types=["xlsx"])
+
+    run(config)
+
+    assert collection.count() > 0
+    assert {entry["metadata"]["section"] for entry in collection.docs.values()
+            if entry["metadata"]["section"]} == {"Tariff 2024"}
+    entry = scrap(config, "tariff.xlsx")
+    assert entry["status"] == ingest.INDEXED
+    assert entry["chunk_count"] == collection.count()
+    # Spreadsheets have no pages, so citations fall back to file + sheet name.
+    assert all(entry["metadata"]["page"] == -1 for entry in collection.docs.values())
+    assert all(entry["metadata"]["file_type"] == "xlsx"
+               for entry in collection.docs.values())
+
+
 def test_extract_pages_reports_errors_without_raising(tmp_path, monkeypatch):
     path = tmp_path / "a.txt"
+    path.write_text("content", encoding="utf-8")
 
     def explode(*_args, **_kwargs):
         raise ValueError("boom")
@@ -660,13 +799,13 @@ def test_zero_byte_file_is_empty(tmp_path, store):
 
 def test_unsupported_file_type_is_reported_not_fatal(tmp_path, store, capsys):
     collection, _ = store
-    corpus = write_corpus(tmp_path / "corpus", {"table.csv": "a,b\n1,2\n"})
-    config = write_config(tmp_path, corpus, file_types=["csv"])
+    corpus = write_corpus(tmp_path / "corpus", {"old_order.doc": "binary-ish"})
+    config = write_config(tmp_path, corpus, file_types=["doc"])
 
     assert run(config) == 0
 
     assert collection.count() == 0
-    assert scrap(config, "table.csv")["status"] == ingest.UNSUPPORTED
+    assert scrap(config, "old_order.doc")["status"] == ingest.UNSUPPORTED
     assert "Not indexed" in capsys.readouterr().out
 
 

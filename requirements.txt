@@ -11,11 +11,15 @@ pyyaml>=6.0                # config.yaml loading (scan_extensions.py, dedup scri
 # --- Active: development / tests ----------------------------------------
 pytest>=8.0                # python -m pytest  (tests/)
 
-# --- Active: optional per-filetype deduplication ------------------------
-# The dedup script imports these lazily. Without them, matching file types
-# fall back to a size+path signature instead of crashing.
-pdfplumber>=0.11.0         # PDF text extraction for content signatures
-python-docx>=1.1.0         # .docx text extraction for content signatures
+# --- Active: per-filetype text extraction -------------------------------
+# Imported lazily by the ingest script. Without them, the matching file types
+# are reported as `unsupported` (and dedup falls back to a size+path signature)
+# instead of crashing.
+pdfplumber>=0.11.0         # PDF text + per-page extraction
+python-docx>=1.1.0         # .docx paragraphs and tables
+openpyxl>=3.1.0            # .xlsx / .xlsm worksheets
+xlrd>=2.0.1                # legacy .xls worksheets (xlrd 2.x reads .xls only)
+# .csv is handled with the standard-library csv module - no dependency needed
 
 # --- Optional: turns on the indexing stage of incremental_ingest.py ------
 # Without these the script still detects changes, extracts and chunks text, and

@@ -54,3 +54,7 @@ collection_name: "kerc_docs"
 # OCR fallback trigger: PDFs below this many characters per page are considered
 # to have no text layer, and are marked needs_ocr instead of indexed.
 ocr_min_chars_per_page: 50
+
+# Spreadsheets: rows kept per sheet before the rest are dropped (keeps a huge
+# tariff sheet from becoming one enormous embedding batch).
+spreadsheet_max_rows: 5000

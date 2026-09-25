@@ -183,9 +183,16 @@ dedup signature, page count, chunk count and status per file. Per change type:
   - **manifest from a newer script** (`schema_version`) → refused rather than silently downgraded
 - Chunk ids are derived as `sha1("<rel_path>|<content_hash>|<index>")`, so the manifest stores only
   `chunk_count` instead of every id, and chunks are still pruned/updated by metadata filters.
-- Chunks never span pages, so citations keep an exact page number; `.txt`/`.md`/`.docx` have
-  no pages and record `page = -1`. Partially scanned files keep a `pages_without_text` count for
-  the future OCR pass.
+- Chunks never span pages, so citations keep an exact page number; `.txt`/`.md`/`.docx` and
+  spreadsheets have no pages and record `page = -1`. Partially scanned files keep a
+  `pages_without_text` count for the future OCR pass.
+- Extraction coverage: `.pdf` (pdfplumber), `.docx` (python-docx), `.txt`/`.md`, spreadsheets
+  (`.xlsx`/`.xlsm` via openpyxl, `.xls` via xlrd, `.csv` via stdlib). A missing library or an
+  unimplemented format yields `unsupported` with the reason, never a crash — `.doc` and `.rtf` are
+  still in that bucket (4 `.doc` files in the corpus).
+- Spreadsheets are cited by **sheet name**: each worksheet becomes one page whose name is the chunk
+  `section` (there are no page numbers to point at), and rows are capped per sheet by
+  `spreadsheet_max_rows` with the drop recorded in the file's `note`.
 - Without `sentence-transformers`/`chromadb` the run still extracts, chunks and updates the
   manifest (files land in `pending_embedding`); it never blocks on the heavy dependencies.
 

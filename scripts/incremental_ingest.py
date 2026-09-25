@@ -39,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -77,6 +78,16 @@ try:
     from docx import Document
 except ImportError:
     Document = None
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    import xlrd  # legacy .xls only; xlrd 2.x dropped xlsx support
+except ImportError:
+    xlrd = None
 
 
 SCHEMA_VERSION = 1
@@ -425,8 +436,9 @@ def extract_pages(path: Path, config: dict) -> tuple[list[dict] | None, str | No
     """
     Extract text per page. Returns (pages, error_note).
 
-    `pages` is a list of {"page": int|None, "text": str}; page is None for formats
-    without pages (docx/txt/md), where citations fall back to the file itself.
+    `pages` is a list of {"page": int|None, "text": str, "label": str|None}; page is
+    None for formats without pages (docx/txt/md/sheets) and the optional label is
+    what cites them instead - today the worksheet name for spreadsheets.
     None means the format is not supported yet.
     """
     suffix = path.suffix.lower()
@@ -454,10 +466,92 @@ def extract_pages(path: Path, config: dict) -> tuple[list[dict] | None, str | No
         if suffix in {".txt", ".md"}:
             return [{"page": None, "text": path.read_text(encoding="utf-8", errors="ignore")}], None
 
+        if suffix in {".xlsx", ".xlsm"}:
+            if openpyxl is None:
+                return None, "openpyxl not installed"
+            return extract_xlsx(path, config)
+
+        if suffix == ".xls":
+            if xlrd is None:
+                return None, "xlrd not installed (needed for legacy .xls)"
+            return extract_xls(path, config)
+
+        if suffix == ".csv":
+            return extract_csv(path, config)
+
     except Exception as exc:  # unreadable/encrypted/corrupt files must not kill the run
         return [], f"{type(exc).__name__}: {exc}"
 
     return None, f"{suffix} extraction not implemented"
+
+
+def render_rows(rows, config: dict) -> tuple[str, int]:
+    """
+    Turn spreadsheet rows into text lines, one row per line, cells joined by ' | '.
+
+    Returns (text, dropped_row_count). The cap keeps a runaway sheet (tens of
+    thousands of tariff rows) from producing one enormous embedding batch.
+    """
+    limit = config.get("spreadsheet_max_rows", 5000)
+    lines: list[str] = []
+    dropped = 0
+    for row in rows:
+        cells = [str(value).strip() for value in row
+                 if value is not None and str(value).strip()]
+        if not cells:
+            continue
+        if len(lines) >= limit:
+            dropped += 1
+            continue
+        lines.append(" | ".join(cells))
+    return "\n".join(lines), dropped
+
+
+def extract_xlsx(path: Path, config: dict) -> tuple[list[dict], str | None]:
+    """One page per worksheet, labelled with the sheet name."""
+    limit = config.get("spreadsheet_max_rows", 5000)
+    pages: list[dict] = []
+    notes: list[str] = []
+    # data_only=True reads cached formula results; read_only streams big sheets.
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for sheet in workbook.worksheets:
+            text, dropped = render_rows(sheet.iter_rows(values_only=True), config)
+            if dropped:
+                notes.append(f"{sheet.title}: first {limit} rows kept, {dropped} dropped")
+            if text:
+                pages.append({"page": None, "label": sheet.title, "text": text})
+    finally:
+        workbook.close()
+    return pages, "; ".join(notes) or None
+
+
+def extract_xls(path: Path, config: dict) -> tuple[list[dict], str | None]:
+    """Legacy .xls via xlrd - same shape as the xlsx path."""
+    limit = config.get("spreadsheet_max_rows", 5000)
+    pages: list[dict] = []
+    notes: list[str] = []
+    workbook = xlrd.open_workbook(str(path), on_demand=True)
+    try:
+        for name in workbook.sheet_names():
+            sheet = workbook.sheet_by_name(name)
+            rows = (sheet.row_values(index) for index in range(sheet.nrows))
+            text, dropped = render_rows(rows, config)
+            if dropped:
+                notes.append(f"{name}: first {limit} rows kept, {dropped} dropped")
+            if text:
+                pages.append({"page": None, "label": name, "text": text})
+    finally:
+        workbook.release_resources()
+    return pages, "; ".join(notes) or None
+
+
+def extract_csv(path: Path, config: dict) -> tuple[list[dict], str | None]:
+    limit = config.get("spreadsheet_max_rows", 5000)
+    with path.open("r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
+        text, dropped = render_rows(csv.reader(handle), config)
+    note = f"first {limit} rows kept, {dropped} dropped" if dropped else None
+    return ([{"page": None, "label": None, "text": text}] if text else []), note
 
 
 def has_text_layer(pages: list[dict], config: dict) -> bool:
@@ -557,7 +651,7 @@ def build_chunks(pages: list[dict], config: dict) -> list[dict]:
     """Chunk each page separately so every chunk keeps an exact page citation."""
     chunks: list[dict] = []
     for page in pages:
-        for chunk in chunk_text(page["text"], None, config):
+        for chunk in chunk_text(page["text"], page.get("label"), config):
             chunks.append({**chunk, "page": page["page"]})
     return chunks
 
