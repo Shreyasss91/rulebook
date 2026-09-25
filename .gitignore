@@ -37,3 +37,6 @@ build/
 
 # Deduplication temp files
 docs/deduplication_progress.json
+
+# Generated ingestion state (regenerated at runtime)
+docs/file_manifest.json
