@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Measured on the real corpus (2026-09-25)
+- First `--audit` run against `D:/Office PC/D DRIVE/KERC`: 1,036 files scanned, 55 skipped by the
+  ignore list, so **819 files / 19,098 pages / 37,118 chunks are indexable as they stand**
+- **143 files need OCR**, and — the bigger finding — **1,246 pages (7%) inside the otherwise
+  indexable files have no text layer**, which would quietly break citations there. Full numbers and
+  the folder breakdown are in `docs/kerc_folder_inventory.md`
+- 10 unsupported files (6 spreadsheets, now fixed, plus 4 `.doc`), 1 empty file, and 8 Word lock
+  files (`~$*.docx`) that fail as `error`; no duplicate content and no stale ignore-list entries,
+  confirming all 55 entries match on the real corpus
+
 ### Planned
 - Build RAG query interface (CLI + Gradio UI) with citation support
 - Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)

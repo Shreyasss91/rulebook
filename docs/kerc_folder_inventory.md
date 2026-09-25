@@ -88,6 +88,60 @@
 
 ---
 
+## Measured Ingest Audit (2026-09-25)
+
+First measurement of the real corpus, from `python scripts/incremental_ingest.py --audit`
+(read-only: it extracts and chunks but writes nothing). These are counts, not estimates.
+
+| Metric | Value |
+|--------|-------|
+| Files scanned (configured types) | 1,036 |
+| Skipped via the dedup ignore list | 55 |
+| **Indexable as-is** | **819 files → 19,098 pages → 37,118 chunks** |
+| Needs OCR (no text layer) | 143 files |
+| Unsupported format | 10 files (4 `.doc`; 6 spreadsheets, since fixed) |
+| Empty | 1 file (`EA Doc3.docx`) |
+| Unreadable | 8 files — all Word lock files (`~$VER PAGE.docx`) |
+| Pages with no text inside *indexable* files | 1,246 pages across 142 files (7% of extracted pages) |
+| Duplicate content outside the ignore list | none |
+| Stale ignore-list entries | none |
+
+### What this changes
+
+- **The OCR workload is smaller than the earlier guess in both directions.** Files that cannot be
+  indexed at all: 143, holding roughly 6,400 pages (25,453 total − 19,098 extracted). At Novita.ai's
+  $0.00003–0.0001/page that is **$0.19–0.64** for the whole remaining OCR job, so there is no reason to
+  triage folders by hand.
+- **The bigger surprise is inside the files that do index:** 1,246 pages (7%) of already-indexable
+  documents have no text layer, across 142 files. Those are mixed print/scan manuals — they will be
+  silently unsearchable unless the OCR pass fills the gaps. This is the argument for page-level OCR
+  rather than file-level (the script already records `pages_without_text` per file).
+- **The scanned/digital split above is off.** `ELECTRICAL INSPECTORATE`, `EXECUTIVE HIGHER` and
+  `KPTCL ESCOMS` hold as many image-only files as `OMBUDSMAN ORDERS`; the earlier table assumed only
+  Ombudsman RAW and BESCOM drawings were scans.
+- **Embedding load is 37,118 chunks** for the first pass, before any OCR text is added.
+- Spreadsheet handling was fixed during this audit (`scripts/incremental_ingest.py`); the 4 `.doc`
+  files still need antiword/LibreOffice, and `~$*.docx` Word lock files should ideally come out of the
+  corpus rather than being retried as errors.
+
+### needs_ocr by top-level folder
+
+| Folder | Files |
+|--------|-------|
+| CHECK and PRINT | 29 |
+| ELECTRICAL INSPECTORATE | 20 |
+| EXECUTIVE HIGHER | 18 |
+| KPTCL ESCOMS | 18 |
+| OMBUDSMAN ORDERS | 18 |
+| KERC | 13 |
+| remaining folders | 27 |
+
+Note: an audit run hashes every file and takes about 75 minutes on the i5/8 GB machine this corpus
+lives on (~25 min hashing and PDF signatures, ~50 min text extraction), which is why the results are
+recorded here rather than regenerated casually.
+
+---
+
 ## Recommended Processing Order
 
 1. **Deduplicate** — Remove exact duplicates by content hash
@@ -99,10 +153,11 @@
 
 ## Next Steps
 
-- [ ] Write deduplication script (SHA-256 of first/last page text + file size)
-- [ ] Create prioritized ingestion list
-- [ ] Test OCR on sample scanned pages
-- [ ] Build RAG index with citations
+- [x] Write deduplication script (SHA-256 of first/last page text + file size)
+- [x] Create prioritized ingestion list
+- [ ] Test OCR on sample scanned pages — start with the 143 `needs_ocr` files and the 1,246 blank
+      pages inside indexed files
+- [ ] Build RAG index with citations — 819 files / 37,118 chunks are ready to embed today
 
 ---
 
