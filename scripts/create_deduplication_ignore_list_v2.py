@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Deduplication script - configurable via config.json.
+Deduplication script - configurable via config.yaml.
 Creates an ignore list (files to skip) without deleting anything.
 Supports multiple source folders and file types.
 """
 
 import hashlib
 import json
+import yaml
 from pathlib import Path
 from collections import defaultdict
 import sys
@@ -25,14 +26,14 @@ except ImportError:
     HAS_DOCX = False
 
 
-CONFIG_PATH = Path("config.json")
+CONFIG_PATH = Path("config.yaml")
 
 
 def load_config() -> dict:
-    """Load configuration from config.json."""
+    """Load configuration from config.yaml."""
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 def get_file_signature(file_path: Path, config: dict) -> str:

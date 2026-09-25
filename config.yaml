@@ -1,0 +1,35 @@
+# Deduplication Configuration
+# All paths relative to project root or absolute
+
+docs_source:
+  - "D:/Office PC/D DRIVE/KERC"
+
+# High priority - commonly found in regulatory/legal corpora
+file_types:
+  - "pdf"
+  - "txt"
+  - "docx"
+  - "doc"
+  - "md"
+  - "rtf"          # Rich Text Format - common in govt docs
+  - "xlsx"         # Excel - tariff tables, schedules
+  - "xls"          # Legacy Excel
+  - "xlsm"         # Excel with macros
+  - "csv"          # Comma-separated data tables
+
+# Medium priority - check if present in your corpus
+#   - "odt"          # OpenDocument Text
+#   - "html"         # Web-sourced regulations
+#   - "htm"          # Legacy HTML
+#   - "json"         # Structured data/APIs
+#   - "xml"          # Legal markup (Akoma Ntoso)
+
+# Low priority - rare in regulatory contexts
+#   - "epub"         # Published regulations
+#   - "pptx"         # Presentations
+#   - "ppt"          # Legacy PowerPoint
+
+ignore_list_path: "docs/deduplication_ignore_list.json"
+progress_path: "docs/deduplication_progress.json"
+batch_size: 100
+signature_prefix_chars: 300
