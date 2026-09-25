@@ -182,7 +182,72 @@ pip install pytesseract pdf2image ocrmypdf
 
 ---
 
-## Quick Start Prototype (Updated with OCR)
+## Novita.ai DeepSeek OCR 2 — Actual API Pricing
+
+**Source:** https://novita.ai/models/model-detail/deepseek-deepseek-ocr-2?from=pricing
+
+### Pricing
+| Metric | Cost |
+|--------|------|
+| **Input tokens** | $0.03 / 1M tokens |
+| **Output tokens** | $0.03 / 1M tokens |
+
+### Cost Per Page Calculation
+
+| Component | Est. Tokens |
+|-----------|-------------|
+| Image (1024×1024 vision patches) | ~576–1,024 |
+| Prompt | ~50–100 |
+| Output text (full page) | ~500–2,000 |
+| **Total per page** | **~1,100–3,100 tokens** |
+
+```
+$0.03 / 1,000,000 = $0.00000003 per token
+
+Low (1,100 tokens):  1,100 × $0.00000003 = $0.000033 ≈ $0.00003/page
+High (3,100 tokens): 3,100 × $0.00000003 = $0.000093 ≈ $0.00009/page
+```
+
+**≈ $0.00003–0.0001 per page** (3–10 cents per 1,000 pages)
+
+### Your 50 PDFs — Real Cost Estimates
+
+| Scenario | Pages | Total Cost |
+|----------|-------|------------|
+| 50 PDFs × 10 pages | 500 | **$0.015–0.05** |
+| 50 PDFs × 20 pages | 1,000 | **$0.03–0.10** |
+| Hybrid (10% via API = 50 pages) | 50 | **$0.0015–0.005** |
+| **All pages via Novita.ai** | 500–1,000 | **$0.015–0.10** |
+
+### Price Comparison
+
+| Provider | Cost/Page | 500 Pages |
+|----------|-----------|-----------|
+| **Novita.ai DeepSeek OCR 2** | **$0.00003–0.0001** | **$0.015–0.05** |
+| Previous estimate (DeepSeek direct) | $0.001–0.01 | $0.50–5.00 |
+| Tesseract (local) | $0 | $0 |
+
+**Novita.ai is 10–100× cheaper than previous estimates!** At these prices, running ALL pages through the API is trivial cost.
+
+### Updated Practical Options
+
+| Option | Description | Cost (500 pages) | Speed | Quality |
+|--------|-------------|------------------|-------|---------|
+| **1. Tesseract only (local)** | ocrmypdf on all | $0 | 10–30 min | Good for clean scans |
+| **2. Novita.ai DeepSeek OCR 2 (all pages)** | API for entire corpus | **$0.015–0.05** | 5–10 min | Best (7B+ model) |
+| **3. Hybrid (Recommended)** | Tesseract 90% + Novita.ai 10% | **$0.0015–0.005** | 15 min | Best of both |
+
+### New Recommendation
+
+At **$0.00003–0.0001/page**, the API cost is negligible. You can now:
+
+1. **Run Tesseract/ocrmypdf on all** — free, makes PDFs permanently searchable
+2. **Optionally re-process ALL pages via Novita.ai** for $0.03–0.10 total — superior quality, structured output (markdown/JSON), handles tables/Kannada/handwriting
+3. **Or hybrid** — Tesseract first, Novita.ai only for flagged pages ($0.001–0.005)
+
+The hardware constraint (8 GB RAM, 2 GB VRAM) is now irrelevant for API usage. You get 7B+ model quality with zero local compute.
+
+---
 
 ## Quick Start Prototype (Updated with OCR)
 
