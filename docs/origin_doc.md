@@ -120,6 +120,68 @@ pip install pytesseract pdf2image ocrmypdf
 
 ---
 
+## DeepSeek OCR Local Inference — Hardware Assessment
+
+### Your PC Specs
+| Component | Spec |
+|-----------|------|
+| **CPU** | Intel Core i5-13500T (14 cores, 20 threads, 1.6–4.6 GHz) |
+| **RAM** | **8 GB** total (≈7.7 GB usable) |
+| **GPU** | **Intel UHD Graphics 770** (integrated, **2 GB shared VRAM**) |
+| **OS** | Windows 10 Pro |
+
+### DeepSeek OCR Models (from `deepseek-ai/DeepSeek-OCR` & `DeepSeek-OCR-2`)
+| Repo | Likely Base Model | Est. Parameters | Open Weights |
+|------|-------------------|-----------------|--------------|
+| `DeepSeek-OCR` | DeepSeek-VL-1.3B or 7B | 1.3B–7B | ✅ Yes (Apache 2.0 / MIT) |
+| `DeepSeek-OCR-2` | Updated VL model (likely 7B+) | 7B+ | ✅ Yes |
+
+**Both CAN run locally** — cost = $0 after download. But hardware constraints apply.
+
+### VRAM Requirements (4-bit Quantization)
+| Model Size | Min VRAM (4-bit) | Min VRAM (8-bit) | Your GPU (2 GB) |
+|------------|------------------|------------------|-----------------|
+| 1.3B | ~1.5 GB | ~2.5 GB | ⚠️ Barely (4-bit only) |
+| 7B | ~5 GB | ~8 GB | ❌ No |
+| 14B+ | ~10 GB | ~16 GB | ❌ No |
+
+### System RAM Requirements (CPU Offload via llama.cpp)
+| Model | CPU Offload RAM | Your 8 GB RAM |
+|-------|-----------------|---------------|
+| 1.3B (4-bit) | ~2 GB | ✅ Possible |
+| 7B (4-bit) | ~5 GB | ⚠️ Tight (OS + app + model) |
+| 7B (8-bit) | ~8 GB | ❌ No |
+
+### Feasibility Verdict for Your Hardware
+| Model | Feasibility | Expected Speed |
+|-------|-------------|----------------|
+| **DeepSeek-OCR 1.3B (4-bit, CPU)** | ✅ **Possible** | ~5-10 sec/page |
+| DeepSeek-OCR 7B (4-bit, CPU) | ⚠️ Marginal (OOM risk) | ~30-60 sec/page |
+| DeepSeek-OCR-2 (likely 7B+) | ❌ **Not feasible** | N/A |
+| Any model on iGPU (2 GB VRAM) | ❌ **Not feasible** | N/A |
+
+### Practical Options for You
+
+| Option | Description | Cost | Speed | Quality |
+|--------|-------------|------|-------|---------|
+| **1. Local 1.3B (CPU, llama.cpp)** | Run quantized 1.3B model on CPU | $0 | ~5-10 sec/page | Lower than 7B |
+| **2. Cloud API (DeepSeek/OpenRouter)** | Pay per page | ~$0.001-0.01/page | 1-2 sec/page | Best (full 7B+) |
+| **3. Hybrid (Recommended)** | Tesseract for 90%, API for 10% | ~$0.10-0.50 total | 15 min total | Best of both |
+
+### Why NOT Run DeepSeek OCR Locally on This Hardware
+1. **8 GB RAM is insufficient** for 7B+ models that make DeepSeek OCR worth using over Tesseract
+2. **2 GB iGPU VRAM** cannot run any vision-language model (need 8+ GB VRAM)
+3. **1.3B variant** (if available as GGUF) would be slower AND less accurate than Tesseract for clean scans
+4. **CPU inference** on 1.3B: ~5-10 sec/page vs Tesseract's ~0.5 sec/page
+
+### Updated Recommendation
+
+**Stick with the hybrid approach:**
+1. `ocrmypdf` (Tesseract) on full corpus — free, fast, makes PDFs searchable permanently
+2. DeepSeek **API** only for problematic pages — pennies, high quality, no hardware constraints
+
+---
+
 ## Quick Start Prototype (Updated with OCR)
 
 ## Quick Start Prototype (Updated with OCR)
