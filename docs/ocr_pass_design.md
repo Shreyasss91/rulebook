@@ -55,6 +55,7 @@ scan_sources ──► classify ──► process_new_or_modified
                                  │
                                  ├─ extract_pages(path, config)          # pdfplumber
                                  │     └─► NEW: ocr_missing_pages(...)   # only blank/low pages
+                                 │           └─► ocrmypdf --skip-text    # searchable PDF artefact (best-effort)
                                  ├─ build_chunks(pages)                  # unchanged
                                  ├─ index_chunks(...)                    # unchanged
                                  └─ manifest fields                      # + ocr_* fields
@@ -90,17 +91,21 @@ class OcrEngine:                       # scripts/ocr.py or a section of incremen
 - `tesseract` — local only.
 - `novita` — API only.
 - `hybrid` — Tesseract first; escalate a page to Novita when Tesseract returns less than
-  `ocr_escalate_below_chars` characters or the engine reports low confidence. This is the
-  recommended default, matching `docs/origin_doc.md`.
+  `ocr_escalate_below_chars` characters or the engine reports low confidence. **This is the default**
+  (`ocr_backend: hybrid`), matching `docs/origin_doc.md`.
 
 Rendering: pdfplumber's `page.to_image(resolution=ocr_dpi)` (Pillow/pypdfium2) avoids adding poppler
-as a system dependency, so only the OCR wrapper + binary are new. Rendering happens at
+as a system dependency, so the new pieces are the OCR wrapper + Tesseract binary, and — for the
+searchable-PDF artefact below — `ocrmypdf` + Ghostscript. Rendering happens at
 `ocr_dpi` (default 300, as `docs/origin_doc.md` advises for scanned government orders).
 
-Language: `ocr_languages` (default `eng+kan`) is passed to Tesseract, since KERC orders mix
-English and Kannada.
+Language: `ocr_languages` (default `eng+kan`) is required **strictly**: KERC orders mix English and
+Kannada, and OCR'ing them as English-only would silently garble the Kannada sections. An engine whose
+language data is not installed reports *not available* (checked once at start-up via Tesseract's
+language list, and by the API's model for Novita), so affected files stay `needs_ocr` and are picked
+up once the pack is installed — no English-only fallback, and no wasted attempt.
 
-## 5. Caching and idempotency
+## 5. Caching, artefacts and idempotency
 
 OCR is the slow/expensive step, so its output is cached rather than recomputed:
 
@@ -109,8 +114,26 @@ OCR is the slow/expensive step, so its output is cached rather than recomputed:
   **gitignored** (`data/` already is), so nothing large lands in the repo.
 - Same `content_hash` + same OCR settings ⇒ cache hit, no engine call. This is what makes a re-run
   after a crash free, and what makes `--full-hash` runs cheap.
-- The rendered image is never stored; only the text. (An `ocrmypdf` searchable-PDF sidecar is a
-  possible later variant, but it duplicates every PDF and is outside this pass.)
+- The rendered image is never stored; only the text. The cache is the source of truth for chunking,
+  so retrieval does not depend on the artefact below and works even when `ocrmypdf` is absent.
+
+### Searchable PDF artefacts
+
+**Decision: also emit searchable PDFs**, so a human browsing `D:/.../KERC` in a normal PDF reader can
+search the scanned orders too. Rules:
+
+- Written to `ocr_pdf_path` (default `data/ocr_pdfs/`), **mirrored by relative path**, and gitignored.
+  The corpus itself stays read-only — nothing is ever written into `docs_source`, preserving the
+  "deduplication/ingest never modifies files" convention.
+- Produced with `ocrmypdf --skip-text --language eng+kan`, whose `--skip-text` leaves pages that
+  already have a text layer untouched and OCRs only the missing ones — the same page-level intent as
+  the text pass, so the two cannot diverge on which pages are touched.
+- **Only files that actually had pages OCR'd get an artefact** (~285 files, not the whole corpus), so
+  the disk cost is a fraction of a full mirror rather than a duplicate of all 994 PDFs.
+- Regenerated only when the artefact is missing or the source `content_hash` changed. `ocrmypdf` is
+  free and local; it is never called for a page the cache already answered.
+- Best-effort: if Ghostscript/`ocrmypdf` is missing, the text cache still populates the chunks and
+  the run records a note instead of failing — the artefact is a by-product, not the deliverable.
 
 ## 6. Change detection: the one correctness trap
 
@@ -172,6 +195,8 @@ run:
 - `--ocr-limit N` caps the number of *pages* OCR'd in a single run, for a cheap trial pass over a
   subset; the rest are simply left for the next run.
 - `--source` + `--ocr-limit` give a safe first real test on one folder.
+- The searchable-PDF artefact is free and local (`ocrmypdf`/Tesseract) and covers only files that
+  were OCR'd, so it adds no API cost.
 - The summary prints pages OCR'd, cache hits, engine calls, and estimated spend before/after, so the
   number is visible even when small.
 
@@ -179,13 +204,15 @@ run:
 
 ```yaml
 # OCR pass (docs/ocr_pass_design.md)
-ocr_backend: "hybrid"            # tesseract | novita | hybrid
-ocr_dpi: 300                     # page render resolution for scanned orders
-ocr_languages: "eng+kan"         # KERC orders mix English and Kannada
-ocr_cache_path: "data/ocr_cache" # gitignored; keyed by content_hash + settings
-ocr_escalate_below_chars: 200    # hybrid: escalate a Tesseract page below this
-ocr_max_pages_per_file: 500      # runaway-document cap
-# ocr_min_chars_per_page: 50     # already exists - the page-level trigger
+ocr_backend: "hybrid"              # tesseract | novita | hybrid  (default: hybrid)
+ocr_dpi: 300                       # page render resolution for scanned orders
+ocr_languages: "eng+kan"           # strict - no English-only fallback
+ocr_cache_path: "data/ocr_cache"   # gitignored; keyed by content_hash + settings
+ocr_pdf_path: "data/ocr_pdfs"      # gitignored; searchable PDFs for the files that were OCR'd
+ocr_write_searchable_pdfs: true    # ocrmypdf --skip-text artefact, best-effort
+ocr_escalate_below_chars: 200      # hybrid: escalate a Tesseract page below this
+ocr_max_pages_per_file: 500        # runaway-document cap
+# ocr_min_chars_per_page: 50       # already exists - the page-level trigger
 ```
 
 No new hardcoded paths or types: `ocr_cache_path` and the engine choice come from config, matching
@@ -208,6 +235,9 @@ key.
   right attempt handling and eventual parking under `--strict`
 - partial success: some pages recovered → indexed, remainder recorded in `pages_without_text`
 - limits: `ocr_max_pages_per_file` and `--ocr-limit` cap engine calls and are reported
+- artefact: a file that had pages OCR'd gets one faked `ocrmypdf --skip-text` call into `ocr_pdf_path`,
+  a file with a full text layer gets none, and a missing `ocrmypdf`/Ghostscript records a note instead
+  of failing the run
 - citations: a recovered page keeps its page number in chunk metadata
 
 ## 11. Rollout
@@ -224,15 +254,28 @@ key.
    recovered-page counts.
 5. Only after that is `needs_ocr` expected to drain to near zero, and the milestone closed.
 
-## 12. Open questions
+External prerequisites for step 4: the `D:` drive mounted, the Tesseract binary with the **Kannada**
+traineddata (`kan`) installed, Ghostscript (for `ocrmypdf` artefacts), and `NOVITA_API_KEY` exported
+for the `hybrid` escalation.
 
-- **Default backend for step 1's first real run** — local Tesseract only (free, slower, weaker on
-  tables/Kannada) vs `hybrid` from the start (needs the API key and a spend ceiling). The doc
-  recommends `hybrid`, but the spike should settle it.
-- **Where OCR text lives long-term** — the page cache is enough for retrieval; deduplicate against
-  it, or also emit `ocrmypdf` searchable PDFs for human use? Out of scope here, worth deciding before
-  the corpus run.
-- **Language packs** — `eng+kan` needs the Kannada Tesseract traineddata installed; if it is absent,
-  the engine should degrade to `eng` with a note rather than fail.
-- **First-run cost of the fingerprint change** — the 142 mixed files will be re-extracted and
-  re-embedded once (they are already indexed), so budget for that churn in the first post-OCR run.
+## 12. Settled decisions
+
+Resolved 2026-09-26, before implementation:
+
+1. **Default backend: `hybrid`.** Tesseract carries the bulk for free; low-confidence pages escalate
+   to Novita DeepSeek OCR 2. `NOVITA_API_KEY` is required for escalation; if the key is absent the
+   run degrades to Tesseract-only with a note rather than stalling. Whole-job cost stays ~$0.19–0.64.
+2. **OCR text lives in both a page cache and searchable PDFs.** The cache
+   (`data/ocr_cache/`) is the retrieval source of truth; `ocrmypdf --skip-text` mirrors only the
+   affected files into `data/ocr_pdfs/` for human use. The corpus is never written to, and a missing
+   `ocrmypdf`/Ghostscript is a note, not a failure.
+3. **`eng+kan` is required, strictly.** No English-only fallback — a missing Kannada pack parks
+   files as `needs_ocr` (capability gap, no attempts burned) until it is installed, so Kannada text
+   is never silently garbled.
+
+### Accepted consequence (not a question)
+
+The `ocr_fingerprint` change re-processes the ~142 already-indexed files that have blank pages exactly
+once: they are re-extracted, re-chunked and re-embedded on the first post-OCR run. That churn is
+inherent to fixing pages that were indexed without text, and it is bounded — `pages_without_text`
+returns to 0 for those files, after which they settle to `UNCHANGED`.
