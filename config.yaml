@@ -40,6 +40,14 @@ track_moves: true          # same content_hash at a new path = MOVED, not NEW+DE
 track_deletions: true      # drop chunks for files that disappeared
 max_retries: 3             # give up on repeatedly failing files (unreadable/corrupt)
 
+# Office owner/lock files: transient artefacts created while a document is open
+# (~$Report.docx from Word/Excel, .~lock.Report.odt# from LibreOffice). They hold
+# no real content, so they are skipped at scan time rather than failing as errors.
+# Matched against the file name, not the path.
+lock_file_patterns:
+  - "~$*"
+  - ".~lock.*#"
+
 # Chunking — legal-aware, so rule/section numbering stays intact
 chunk_size: 1200           # target characters per chunk
 chunk_overlap: 200         # characters carried from the previous chunk

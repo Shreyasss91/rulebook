@@ -556,6 +556,41 @@ def test_scan_groups_duplicate_content(tmp_path):
     assert counters["duplicate_groups"] == [["one/a.txt", "two/a.txt"]]
 
 
+def test_scan_skips_office_lock_files(tmp_path):
+    # ~$*.docx (Word/Excel) and .~lock.*# (LibreOffice) are transient owner files, not
+    # corpus content: they must not enter the manifest as retryable `error` entries.
+    corpus = write_corpus(tmp_path / "corpus", {
+        "a.txt": body(),
+        "~$VER PAGE.docx": "",
+        "sub/.~lock.notes.odt#": "",
+    })
+    config = yaml.safe_load(write_config(tmp_path, corpus).read_text(encoding="utf-8"))
+
+    current, counters = ingest.scan_sources(config, {}, full_hash=False)
+
+    assert set(current) == {"a.txt"}
+    assert counters["lock_files"] == 2
+    assert counters["unreadable"] == 0
+
+
+def test_scan_lock_patterns_come_from_config(tmp_path):
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body(), "draft.tmp.txt": body()})
+    config = yaml.safe_load(write_config(
+        tmp_path, corpus, lock_file_patterns=["*.tmp.txt"]).read_text(encoding="utf-8"))
+
+    current, counters = ingest.scan_sources(config, {}, full_hash=False)
+
+    assert set(current) == {"a.txt"}
+    assert counters["lock_files"] == 1
+
+
+def test_is_lock_file_ignores_normal_names():
+    assert ingest.is_lock_file("~$VER PAGE.docx", ingest.DEFAULT_LOCK_FILE_PATTERNS)
+    assert ingest.is_lock_file(".~lock.notes.odt#", ingest.DEFAULT_LOCK_FILE_PATTERNS)
+    assert not ingest.is_lock_file("VER PAGE.docx", ingest.DEFAULT_LOCK_FILE_PATTERNS)
+    assert not ingest.is_lock_file("notes.odt", ingest.DEFAULT_LOCK_FILE_PATTERNS)
+
+
 # --------------------------------------------------------------------------
 # End-to-end runs
 # --------------------------------------------------------------------------

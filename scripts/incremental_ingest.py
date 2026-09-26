@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import hashlib
 import json
 import os
@@ -93,6 +94,12 @@ except ImportError:
 SCHEMA_VERSION = 1
 HASH_CHARS = 16
 DEFAULT_MAX_RETRIES = 3
+
+# Office owner/lock files (~$Doc.docx from Word/Excel, .~lock.Doc.odt# from
+# LibreOffice/OpenOffice) are transient artefacts created while a document is open:
+# they hold no real content and disappear with the application. They are skipped at
+# scan time instead of being retried as `error` (see lock_file_patterns in config.yaml).
+DEFAULT_LOCK_FILE_PATTERNS = ("~$*", ".~lock.*#")
 
 # Change types
 NEW, MODIFIED, MOVED, DELETED, UNCHANGED = "NEW", "MODIFIED", "MOVED", "DELETED", "UNCHANGED"
@@ -212,6 +219,11 @@ def load_ignore_list(config: dict) -> set[str]:
 # Scan
 # --------------------------------------------------------------------------
 
+def is_lock_file(name: str, patterns: list[str] | tuple[str, ...]) -> bool:
+    """True when a file *name* matches an Office owner/lock pattern (not a path)."""
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
 def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -228,7 +240,9 @@ def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, d
     without re-reading them; anything else gets a fresh content hash. Entries in
     the deduplication ignore list are matched on their path relative to their
     source root - the same convention `create_deduplication_ignore_list_v2.py`
-    writes - and are left out of the manifest entirely.
+    writes - and are left out of the manifest entirely. Office owner/lock files
+    (`lock_file_patterns`, e.g. `~$VER PAGE.docx`) are dropped before the
+    extension filter, so they never enter the manifest as `error` entries.
 
     Two situations are handled defensively because they look like mass deletions:
 
@@ -243,10 +257,11 @@ def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, d
     batch_size = config.get("batch_size", 100)
     ignore = load_ignore_list(config)
     extensions = file_types_extensions(file_types)
+    lock_patterns = config.get("lock_file_patterns", DEFAULT_LOCK_FILE_PATTERNS)
 
     current: dict[str, dict] = {}
     counters = {"scanned": 0, "ignored": 0, "hashed": 0, "unreadable": 0,
-                "overlap": 0, "kept_offline": 0}
+                "overlap": 0, "kept_offline": 0, "lock_files": 0}
     matched_ignores: set[str] = set()
     seen_paths: set[str] = set()
     unreachable: list[str] = []
@@ -257,7 +272,14 @@ def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, d
             unreachable.append(str(root))
             continue
         for path in root.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in extensions:
+            if not path.is_file():
+                continue
+            # Checked before the extension filter so an owner/lock file is dropped
+            # for what it is, not because its extension is not in file_types.
+            if is_lock_file(path.name, lock_patterns):
+                counters["lock_files"] += 1
+                continue
+            if path.suffix.lower() not in extensions:
                 continue
 
             relative = path.relative_to(root).as_posix()
@@ -960,6 +982,9 @@ def report_warnings(scan_stats: dict, current: dict, changes: list[dict]) -> Non
     if scan_stats.get("overlap"):
         print(f"Note: {scan_stats['overlap']} file(s) reachable through two sources were "
               "counted once")
+    if scan_stats.get("lock_files"):
+        print(f"Note: {scan_stats['lock_files']} Office owner/lock file(s) skipped "
+              f"({', '.join(DEFAULT_LOCK_FILE_PATTERNS)})")
     if scan_stats.get("unreadable"):
         print(f"Note: {scan_stats['unreadable']} file(s) could not be read", file=sys.stderr)
     duplicates = scan_stats.get("duplicate_groups") or []
@@ -1073,8 +1098,11 @@ def main(argv: list[str] | None = None) -> int:
     counts = {kind: sum(1 for c in changes if c["type"] == kind)
               for kind in (NEW, MODIFIED, MOVED, DELETED, UNCHANGED)}
     print(f"\nSources: {', '.join(sources)}")
-    print(f"Scanned {scan_stats['scanned']} files ({scan_stats['ignored']} skipped via dedup ignore list, "
-          f"{scan_stats['hashed']} hashed)")
+    skipped = [f"{scan_stats['ignored']} skipped via dedup ignore list"]
+    if scan_stats.get("lock_files"):
+        skipped.append(f"{scan_stats['lock_files']} lock file(s) skipped")
+    skipped.append(f"{scan_stats['hashed']} hashed")
+    print(f"Scanned {scan_stats['scanned']} files ({', '.join(skipped)})")
     print("Changes: " + ", ".join(f"{counts[k]} {k}" for k in counts))
     if write and not can_embed:
         print("Mode: manifest-only (sentence-transformers/chromadb unavailable)")

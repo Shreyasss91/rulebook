@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Office lock-file filtering** — `lock_file_patterns` in `config.yaml` (`~$*` for Word/Excel owner
+  files, `.~lock.*#` for LibreOffice) drops those transient artefacts during the scan
+  (`scripts/incremental_ingest.py`), matched on the file name *before* the extension filter. The 8
+  `~$*.docx` lock files the audit flagged no longer enter the manifest as retryable `error` entries,
+  stop consuming `max_retries` attempts, and no longer make `--strict` exit 2 for cron. The scan
+  summary and warnings report how many were skipped
+- Tests for the lock-file filter (default patterns, config override, and that ordinary names are
+  not affected)
+
 ### Measured on the real corpus (2026-09-25)
 - First `--audit` run against `D:/Office PC/D DRIVE/KERC`: 1,036 files scanned, 55 skipped by the
   ignore list, so **819 files / 19,098 pages / 37,118 chunks are indexable as they stand**
@@ -16,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indexable files have no text layer**, which would quietly break citations there. Full numbers and
   the folder breakdown are in `docs/kerc_folder_inventory.md`
 - 10 unsupported files (6 spreadsheets, now fixed, plus 4 `.doc`), 1 empty file, and 8 Word lock
-  files (`~$*.docx`) that fail as `error`; no duplicate content and no stale ignore-list entries,
-  confirming all 55 entries match on the real corpus
+  files (`~$*.docx`) that fail as `error` (now filtered at scan time — see Added); no duplicate
+  content and no stale ignore-list entries, confirming all 55 entries match on the real corpus
 
 ### Planned
 - Build RAG query interface (CLI + Gradio UI) with citation support

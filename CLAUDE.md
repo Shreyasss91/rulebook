@@ -140,6 +140,11 @@ ignore_list_path: "docs/deduplication_ignore_list.json"
 progress_path: "docs/deduplication_progress.json"
 batch_size: 100
 signature_prefix_chars: 300
+
+# Office owner/lock files skipped at scan time (matched on file name)
+lock_file_patterns:
+  - "~$*"
+  - ".~lock.*#"
 ```
 
 ## Deduplication Logic
@@ -171,6 +176,9 @@ dedup signature, page count, chunk count and status per file. Per change type:
   - **unreachable source** (unmounted drive, renamed folder) → its previous entries are kept as-is,
     never treated as DELETED, so a missing `D:` cannot wipe the collection
   - **overlapping/nested sources** → a file reachable through two roots is processed once
+  - **Office owner/lock files** (`~$*.docx` from Word/Excel, `.~lock.*#` from LibreOffice) → dropped
+    at scan time by `lock_file_patterns` (matched on the file name, before the extension filter), so
+    they never enter the manifest as retryable `error` entries or trip `--strict`
   - **unreadable file** (locked, permission denied) → `error` status with the reason; the run continues
   - **zero-byte file** → `empty`; **blank non-PDF** → `empty`; **image-only PDF** → `needs_ocr`
   - **touched but unchanged** (mtime only) → UNCHANGED, chunks untouched

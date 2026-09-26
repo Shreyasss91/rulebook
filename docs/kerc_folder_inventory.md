@@ -121,8 +121,9 @@ First measurement of the real corpus, from `python scripts/incremental_ingest.py
   Ombudsman RAW and BESCOM drawings were scans.
 - **Embedding load is 37,118 chunks** for the first pass, before any OCR text is added.
 - Spreadsheet handling was fixed during this audit (`scripts/incremental_ingest.py`); the 4 `.doc`
-  files still need antiword/LibreOffice, and `~$*.docx` Word lock files should ideally come out of the
-  corpus rather than being retried as errors.
+  files still need antiword/LibreOffice. The `~$*.docx` Word lock files are now filtered at scan time
+  (`lock_file_patterns` in `config.yaml`), so the 8 "unreadable" entries above are gone from later
+  manifests and no longer surface as errors.
 
 ### needs_ocr by top-level folder
 
