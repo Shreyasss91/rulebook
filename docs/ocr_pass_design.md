@@ -245,9 +245,10 @@ key.
 1. **Spike (no code committed).** Run Tesseract on ~20 pages from `OMBUDSMAN ORDERS`/`KPTCL ESCOMS`
    and compare against Novita on the same pages, to confirm quality assumptions in
    `docs/origin_doc.md` on the real scans. Cheap, and it can change the default backend.
-2. **Phase 1 — Tesseract engine + page-level pass + cache + fingerprint + tests.** The core
-   behaviour above, defaulting to `tesseract` so nothing paid runs by accident.
-3. **Phase 2 — `hybrid` escalation to Novita**, gated behind the API key being present.
+2. **Phase 1 — page-level pass + cache + fingerprint + tests**, with the backend reading `hybrid`
+   from config from the start; escalation simply cannot engage until `NOVITA_API_KEY` is exported, so
+   a keyless machine still runs Tesseract-only and nothing paid happens by accident.
+3. **Phase 2 — enable the Novita escalation path** (the paid branch of `hybrid`) once the key exists.
 4. **Phase 3 — run it.** `--source` one folder with `--ocr-limit`, then the full drive. Requires the
    external `D:` drive mounted and Tesseract installed; this is a deliberate manual run, not
    something the script does on its own. Update `docs/kerc_folder_inventory.md` with the real
@@ -258,24 +259,45 @@ External prerequisites for step 4: the `D:` drive mounted, the Tesseract binary 
 traineddata (`kan`) installed, Ghostscript (for `ocrmypdf` artefacts), and `NOVITA_API_KEY` exported
 for the `hybrid` escalation.
 
-## 12. Settled decisions
+## 12. Decision log
 
-Resolved 2026-09-26, before implementation:
+Three choices were put to the user on 2026-09-26, each with its consequences spelled out, before any
+code was written. The chosen option is marked ✅. Keep this section when the implementation lands —
+the reasoning is the part that is expensive to reconstruct.
 
-1. **Default backend: `hybrid`.** Tesseract carries the bulk for free; low-confidence pages escalate
-   to Novita DeepSeek OCR 2. `NOVITA_API_KEY` is required for escalation; if the key is absent the
-   run degrades to Tesseract-only with a note rather than stalling. Whole-job cost stays ~$0.19–0.64.
-2. **OCR text lives in both a page cache and searchable PDFs.** The cache
-   (`data/ocr_cache/`) is the retrieval source of truth; `ocrmypdf --skip-text` mirrors only the
-   affected files into `data/ocr_pdfs/` for human use. The corpus is never written to, and a missing
-   `ocrmypdf`/Ghostscript is a note, not a failure.
-3. **`eng+kan` is required, strictly.** No English-only fallback — a missing Kannada pack parks
-   files as `needs_ocr` (capability gap, no attempts burned) until it is installed, so Kannada text
-   is never silently garbled.
+### Q1 — Default OCR backend for the first real run
 
-### Accepted consequence (not a question)
+| Option | Consequences considered | Decision |
+|--------|-------------------------|----------|
+| **A. `hybrid` — Tesseract + Novita escalation** | Free Tesseract carries the bulk; only low-confidence/table/Kannada pages reach the paid API, so total cost stays ~$0.19–0.64. Requires `NOVITA_API_KEY`; without it the run degrades to Tesseract-only with a note. Escalated pages (only) leave the machine, so privacy is partial — and only for the pages Tesseract already failed. Slower than API-only on the escalated subset. | ✅ **chosen** |
+| **B. Tesseract only** | Zero cost, fully local, no key to manage, simplest to reason about. Weaker on tables, faded scans and mixed Kannada/English — the exact material in `OMBUDSMAN ORDERS` and `KPTCL ESCOMS`. Would leave visible quality gaps, and adding Novita later re-processes those pages (an `ocr_fingerprint` change), i.e. pays the work twice. | rejected |
+| **C. Spike decides** | Run the ~20-page Tesseract-vs-Novita comparison first and pick from real quality, rather than from `docs/origin_doc.md`. Most evidence-driven, but delays a decision the implementation needs, and the cost to change later is one fingerprint-triggered re-run, which makes waiting low-value. The spike is still kept as step 1 of the rollout — it can *confirm* the choice cheaply. | rejected as a blocker; retained as validation |
+
+Notably, A makes the fallback path explicit: a missing key degrades rather than stalls, so the
+"no accidental spend" property does not depend on the default alone.
+
+### Q2 — Where OCR text lives long-term
+
+| Option | Consequences considered | Decision |
+|--------|-------------------------|----------|
+| **A. Page cache only** (`data/ocr_cache/`) | Cheapest and smallest: no duplicated PDFs, nothing but text on disk, cache keyed by `content_hash` so re-runs are free. Enough for retrieval and page-exact citations. Leaves the corpus unsearchable for a human opening a PDF in Acrobat/Edge — the scans stay image-only forever, and every future consumer (a different RAG stack, a manual lookup) re-runs OCR. | superseded by B |
+| **B. Cache + `ocrmypdf --skip-text` searchable PDFs** | Adds a human-usable artefact: the affected PDFs become text-searchable in any reader, permanently, free and local (`ocrmypdf`/Tesseract — no API cost). Costs disk and a new dependency chain (`ocrmypdf` + Ghostscript). Mitigated by mirroring **only** the ~285 files that actually had pages OCR'd (not all 994), writing to `data/ocr_pdfs/` and never into the corpus, and by treating the artefact as best-effort (missing Ghostscript is a note, not a failure). `--skip-text` keeps the PDF pass page-aligned with the text pass. | ✅ **chosen** |
+
+The chosen option also fixes the long-term home of the text: the cache is the retrieval source of
+truth, so nothing downstream depends on the artefact being present.
+
+### Q3 — How to handle Kannada
+
+| Option | Consequences considered | Decision |
+|--------|-------------------------|----------|
+| **A. `eng+kan`, fall back to `eng` with a note** | Never blocks: a missing pack still yields English text for the English portions, and the note records the gap. But the Kannada half of a mixed order is silently garbled — worse than absent, because it produces confident-looking wrong text that citations would then point at. | recommended, rejected |
+| **B. `eng+kan` strictly** | No English-only fallback: an engine whose `kan` data is missing reports *not available*, so affected files park as `needs_ocr` (a capability gap — no `attempts` burned, per §7) until the pack is installed. Guarantees text that is either correct or flagged, never quietly mangled. Cost: nothing is OCR'd until the Kannada traineddata (and the key, for escalation) is in place. | ✅ **chosen** |
+| **C. `eng` only for now** | Simplest first pass, no additional traineddata to install. Leaves Kannada portions of mixed orders unsearchable — a permanent blind spot in a corpus that is explicitly bilingual, and one that is hard to notice later because the files would look successfully indexed. | rejected |
+
+### Not a question — accepted consequence
 
 The `ocr_fingerprint` change re-processes the ~142 already-indexed files that have blank pages exactly
 once: they are re-extracted, re-chunked and re-embedded on the first post-OCR run. That churn is
-inherent to fixing pages that were indexed without text, and it is bounded — `pages_without_text`
-returns to 0 for those files, after which they settle to `UNCHANGED`.
+inherent to fixing pages that were indexed without text (the alternative — a full re-ingest — is
+strictly worse), and it is bounded: `pages_without_text` returns to 0 for those files, after which
+they settle to `UNCHANGED`.

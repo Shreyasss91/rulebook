@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escalation, a text cache keyed by `content_hash` + settings, cost controls that keep
   `--dry-run`/`--audit` from spending, and the `ocr_fingerprint` mechanism needed to re-process
   already-indexed files whose `content_hash` will not change when their text is recovered. The open
-  questions are settled (2026-09-26): `hybrid` as the default backend, a page cache plus
-  `ocrmypdf --skip-text` searchable PDFs for affected files only, and strict `eng+kan` with no
-  English-only fallback
+  questions are settled (2026-09-26) in a decision log that records every option considered, its
+  consequences and the rejection reason as well as the choice: `hybrid` as the default backend, a page
+  cache plus `ocrmypdf --skip-text` searchable PDFs for affected files only, and strict `eng+kan` with
+  no English-only fallback
 
 ### Measured on the real corpus (2026-09-25)
 - First `--audit` run against `D:/Office PC/D DRIVE/KERC`: 1,036 files scanned, 55 skipped by the
