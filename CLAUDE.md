@@ -37,7 +37,8 @@ rule_books/
 │   ├── deduplication_report.md              # Duplicate group details
 │   ├── deduplication_ignore_list.json       # Committed: files to skip during ingestion
 │   ├── deduplication_progress.json          # Gitignored: dedup resume state
-│   └── incremental_update_strategy.md       # Manifest-based incremental pipeline design
+│   ├── incremental_update_strategy.md       # Manifest-based incremental pipeline design
+│   └── ocr_pass_design.md                    # Design for the deferred OCR pass (not implemented)
 └── scripts/
     ├── scan_extensions.py
     ├── create_deduplication_ignore_list_v2.py
@@ -56,6 +57,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → chunk → embed → ChromaDB upsert |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
+| `docs/ocr_pass_design.md` | Design for the OCR pass over pages with no text layer (deferred task, not implemented) |
 | `docs/kerc_folder_inventory.md` | Corpus scan: 994 PDFs, 25K pages, category breakdown, cost projections |
 | `docs/deduplication_report.md` | 55 duplicate groups detailed |
 | `docs/deduplication_ignore_list.json` | 55 file paths to skip during ingestion |

@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tests for the lock-file filter (default patterns, config override, and that ordinary names are
   not affected)
 
+### Documentation
+- **`docs/ocr_pass_design.md`** — design for the deferred `add ocr pass` task, written before any code:
+  page-level OCR that fills only pages with no text layer (`needs_ocr` files plus the 1,246 blank
+  pages inside already-indexed files), a Tesseract/Novita engine abstraction with `hybrid`
+  escalation, a text cache keyed by `content_hash` + settings, cost controls that keep
+  `--dry-run`/`--audit` from spending, and the `ocr_fingerprint` mechanism needed to re-process
+  already-indexed files whose `content_hash` will not change when their text is recovered
+
 ### Measured on the real corpus (2026-09-25)
 - First `--audit` run against `D:/Office PC/D DRIVE/KERC`: 1,036 files scanned, 55 skipped by the
   ignore list, so **819 files / 19,098 pages / 37,118 chunks are indexable as they stand**
