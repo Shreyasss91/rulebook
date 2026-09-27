@@ -10,6 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **RAG query CLI** (`scripts/query_cli.py`, design in `docs/query_cli_design.md`) — answers questions
+  over the collection `incremental_ingest.py` wrote, with page-exact citations (the v1.0.0 milestone):
+  - **Retrieval** reuses `chroma_path`/`collection_name`/`embedding_model`, converts Chroma's cosine
+    **distance** to a similarity score, retrieves a wider candidate pool before applying `--min-score`
+    and `-k`, and can require an exact substring (`--contains`) for rule-number lookups the embedding
+    ranks poorly
+  - **Cited answers** — excerpts are numbered `[1]…[k]`, the prompt requires inline `[n]` markers, and
+    the markers are validated after generation: an out-of-range citation is reported as hallucinated
+    and an answer with no markers is flagged. The sources are always printed with their scores, so an
+    answer can be checked even when the model misbehaves
+  - **Page-exact citations** from the metadata the ingest wrote — `order.pdf, p.12`, or
+    `tariff.xlsx, sheet "Tariff 2024"` / the heading for page-less formats
+  - **LLM backends** — `ollama` (local, default), `claude` (Messages API, key read from
+    `llm_claude_api_key_env`) and `none`/`--no-llm`; an unreachable engine degrades to an extractive
+    answer with the reason on stderr rather than failing silently
+  - **CLI** — one-shot or `-i/--interactive`, `--json`, `--show-context`, `--llm` override; exit codes
+    `0` answered, `1` setup error, `2` no relevant excerpts. No new dependencies (stdlib HTTP)
+- `tests/test_query_cli.py` — retrieval scoring and filtering, citation rendering for paged and
+  page-less formats, both LLM payload/response shapes, transport-error wrapping, citation validation,
+  the extractive fallback, output rendering and an end-to-end `main()` run; the collection, embedder
+  and HTTP transport are faked, so the suite still needs no model, server or key
 - **OCR pass** (`scripts/incremental_ingest.py`; design and notes in `docs/ocr_pass_design.md`) —
   recovers pages with no text layer between extraction and chunking, without a full re-ingest:
   - **Page-level** — only pages below `ocr_min_chars_per_page` are OCR'd, and recovered text keeps
@@ -73,8 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content and no stale ignore-list entries, confirming all 55 entries match on the real corpus
 
 ### Planned
-- Build RAG query interface (CLI + Gradio UI) with citation support
+- Gradio UI with citations (v1.1.0)
 - Signature-based move detection for renames that also edit content (now a hint only)
+- Hybrid keyword (BM25) retrieval and cross-encoder re-ranking for the query CLI
 
 ---
 
@@ -386,13 +408,13 @@ rule_books/
 
 ---
 
-## Summary Statistics (as of 2026-09-25)
+## Summary Statistics (as of 2026-09-27)
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 30 |
-| **Documents** | 7 markdown files (5 in `docs/`, 2 at root) |
-| **Scripts** | 3 Python scripts |
+| **Commits** | 31 |
+| **Documents** | 8 markdown files (6 in `docs/`, 2 at root) |
+| **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
 | **Est. OCR Cost** | $0.36–1.10 (deduplicated, via Novita.ai) |

@@ -84,3 +84,23 @@ ocr_api_cost_per_page: 0.0001      # only used for the run's cost estimate
 # Spreadsheets: rows kept per sheet before the rest are dropped (keeps a huge
 # tariff sheet from becoming one enormous embedding batch).
 spreadsheet_max_rows: 5000
+
+# --- Query CLI (scripts/query_cli.py) ------------------------------------
+# Reads the same collection incremental_ingest.py wrote. Answer generation is
+# optional: without a usable LLM the CLI still returns the cited excerpts.
+llm_backend: "ollama"          # ollama (local, default) | claude | none
+llm_top_k: 6                   # excerpts retrieved per question
+llm_min_score: 0.0             # cosine similarity floor; 0 drops anti-correlated chunks
+llm_max_context_chars: 6000    # cap on the excerpt text sent to the model
+# Ollama: free, local, private. Server + models: https://ollama.com
+llm_ollama_url: "http://localhost:11434"
+llm_ollama_model: "llama3.2:3b"
+llm_ollama_timeout: 120
+# Claude API: better reasoning, key read from the environment. Set a current
+# model id from https://platform.claude.com/docs/en/api/models/list before use.
+llm_claude_url: "https://api.anthropic.com/v1/messages"
+llm_claude_model: "claude-sonnet-4-5"
+llm_claude_api_key_env: "ANTHROPIC_API_KEY"
+llm_claude_max_tokens: 1024
+llm_claude_timeout: 120
+llm_anthropic_version: "2023-06-01"

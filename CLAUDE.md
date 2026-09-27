@@ -38,11 +38,13 @@ rule_books/
 │   ├── deduplication_ignore_list.json       # Committed: files to skip during ingestion
 │   ├── deduplication_progress.json          # Gitignored: dedup resume state
 │   ├── incremental_update_strategy.md       # Manifest-based incremental pipeline design
-│   └── ocr_pass_design.md                    # OCR pass design, decision log + implementation notes
+│   ├── ocr_pass_design.md                    # OCR pass design, decision log + implementation notes
+│   └── query_cli_design.md                   # Query CLI design (retrieval, citations, LLMs)
 └── scripts/
     ├── scan_extensions.py
     ├── create_deduplication_ignore_list_v2.py
-    └── incremental_ingest.py                 # manifest-based change detection + indexing
+    ├── incremental_ingest.py                 # manifest-based change detection + indexing
+    └── query_cli.py                          # cited Q&A over the indexed collection
 ```
 
 Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `docs/file_manifest.json`.
@@ -54,7 +56,9 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `config.yaml` | Central config: `docs_source` (list), `file_types` (priority tiers), ignore list, progress, batch size |
 | `scripts/create_deduplication_ignore_list_v2.py` | Content-based deduplication (size + first/last page hash) → `docs/deduplication_ignore_list.json` |
 | `scripts/scan_extensions.py` | Recursive scan of `docs_source` for extension counts |
-| `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → chunk → embed → ChromaDB upsert |
+| `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → OCR → chunk → embed → ChromaDB upsert |
+| `scripts/query_cli.py` | Query CLI: embed question → vector search → cited answer (Ollama/Claude/extractive) |
+| `docs/query_cli_design.md` | Query CLI design: retrieval, page-exact citations, LLM backends, failure modes |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
 | `docs/ocr_pass_design.md` | OCR pass design, decision log and implementation notes; runs inside `scripts/incremental_ingest.py` |
@@ -94,6 +98,14 @@ python scripts/incremental_ingest.py
 python scripts/incremental_ingest.py --no-ocr
 python scripts/incremental_ingest.py --ocr-limit 200
 
+# Query the indexed corpus with page-exact citations (see docs/query_cli_design.md)
+python scripts/query_cli.py "what is the late payment surcharge?"
+python scripts/query_cli.py -i                       # interactive
+python scripts/query_cli.py "..." --show-context     # print the full excerpts
+python scripts/query_cli.py "..." --json             # machine-readable
+python scripts/query_cli.py "..." --no-llm           # retrieval only, no model
+python scripts/query_cli.py "Rule 14(3)" --contains "Rule 14(3)"
+
 # Tests (no ChromaDB, no model download needed)
 python -m pytest
 ```
@@ -113,13 +125,16 @@ Three read-only-ish modes, from cheapest to most thorough:
 ## Tests
 
 `tests/test_incremental_ingest.py` covers chunking, extraction, classification, the scanning edge
-cases and end-to-end runs. The vector store and the embedding model are faked, so the suite needs
-neither chromadb/sentence-transformers nor a model download — keep it that way, and add a test with
-every behaviour change to `incremental_ingest.py`.
+cases and end-to-end runs; `tests/test_query_cli.py` covers retrieval scoring, citation rendering,
+both LLM payloads, citation validation, the extractive fallback and the CLI. The vector store, the
+embedding model and the LLM transport are all faked, so the suite needs neither
+chromadb/sentence-transformers, a model download, an Ollama server nor an API key — keep it that
+way, and add a test with every behaviour change to a script.
 
 ```bash
 python -m pytest              # everything
 python -m pytest -k classify  # one area
+python -m pytest -k citation  # the query CLI's citation logic
 ```
 
 ## Config Structure (`config.yaml`)
@@ -152,6 +167,17 @@ signature_prefix_chars: 300
 lock_file_patterns:
   - "~$*"
   - ".~lock.*#"
+
+# Query CLI (scripts/query_cli.py) — reads the same collection
+llm_backend: "ollama"          # ollama (local, default) | claude | none
+llm_top_k: 6                   # excerpts per question
+llm_min_score: 0.0             # cosine similarity floor
+llm_max_context_chars: 6000    # cap on excerpt text sent to the model
+llm_ollama_url: "http://localhost:11434"
+llm_ollama_model: "llama3.2:3b"
+llm_claude_url: "https://api.anthropic.com/v1/messages"
+llm_claude_model: "claude-sonnet-4-5"   # override with a current model id
+llm_claude_api_key_env: "ANTHROPIC_API_KEY"   # read from the environment, never config
 ```
 
 ## Deduplication Logic
@@ -228,6 +254,25 @@ dedup signature, page count, chunk count and status per file. Per change type:
 - Without `sentence-transformers`/`chromadb` the run still extracts, chunks and updates the
   manifest (files land in `pending_embedding`); it never blocks on the heavy dependencies.
 
+## Query CLI
+
+`scripts/query_cli.py` answers questions over the collection `incremental_ingest.py` wrote, with
+page-exact citations (design: `docs/query_cli_design.md`).
+
+- Retrieval reuses `chroma_path`/`collection_name`/`embedding_model`, converts Chroma's cosine
+  **distance** to a similarity score, and can require an exact substring (`--contains`) for rule
+  lookups the embedding ranks poorly.
+- Excerpts are numbered `[1]…[k]` in the prompt, the model is told to cite with those markers, and
+  the markers are validated after generation — an out-of-range `[n]` is surfaced as a hallucinated
+  citation and an answer with no markers is flagged.
+- A chunk's citation is the file plus page (`order.pdf, p.12`); page-less formats cite the sheet name
+  (`tariff.xlsx, sheet "Tariff 2024"`) or the heading, matching the metadata `incremental_ingest.py`
+  writes.
+- `llm_backend` is `ollama` (local, default), `claude` (key from `llm_claude_api_key_env`) or `none`;
+  if the chosen engine is unreachable the CLI returns the cited excerpts and says why, never a silent
+  empty answer. No new dependencies — the HTTP calls use the standard library.
+- Exit codes: `0` answered, `1` setup error (missing deps or an empty index), `2` no relevant excerpts.
+
 ## Conventions
 
 - **Split commits by task, not by session.** When the working tree holds several unrelated changes,
@@ -256,7 +301,7 @@ dedup signature, page count, chunk count and status per file. Per change type:
 
 | Milestone | Version |
 |-----------|---------|
-| RAG query CLI with citation support | v1.0.0 |
+| ~~RAG query CLI with citation support~~ ✅ `scripts/query_cli.py` | v1.0.0 |
 | Gradio UI with citations | v1.1.0 |
 | OCR pipeline integration (Tesseract + Novita.ai hybrid) | implemented, awaiting the real-corpus run |
 | Scheduled auto-ingest via cron | v1.2.0 |

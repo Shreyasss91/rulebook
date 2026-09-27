@@ -22,11 +22,14 @@ openpyxl>=3.1.0            # .xlsx / .xlsm worksheets
 xlrd>=2.0.1                # legacy .xls worksheets (xlrd 2.x reads .xls only)
 # .csv is handled with the standard-library csv module - no dependency needed
 
-# --- Optional: turns on the indexing stage of incremental_ingest.py ------
-# Without these the script still detects changes, extracts and chunks text, and
-# updates the manifest - files just stop at status "pending_embedding" and are
-# picked up by the next run that has them. Left out of the default install
-# because sentence-transformers pulls in PyTorch (~2 GB).
+# --- Optional: indexing + querying (incremental_ingest.py, query_cli.py) --
+# Without these the ingest script still detects changes, extracts and chunks
+# text, and updates the manifest - files just stop at status
+# "pending_embedding" and are picked up by the next run that has them. The query
+# CLI (scripts/query_cli.py) needs both to embed a question and read the store.
+# Left out of the default install because sentence-transformers pulls in PyTorch
+# (~2 GB). The LLM step itself needs no Python package: Ollama and the Claude API
+# are called over stdlib urllib.
 # sentence-transformers>=2.7.0   # all-MiniLM-L6-v2 embeddings (local, CPU)
 # chromadb>=0.4.24               # persistent local vector store (kerch_db/)
 
