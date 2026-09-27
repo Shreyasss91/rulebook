@@ -1164,6 +1164,61 @@ def test_classify_ignores_blank_pages_in_non_pdf_files():
     assert changes[0]["type"] == ingest.UNCHANGED, "only PDFs are OCR candidates"
 
 
+def test_embedding_fingerprint_tracks_the_model():
+    base = ingest.embedding_fingerprint({"embedding_model": "all-MiniLM-L6-v2"})
+
+    assert base == ingest.embedding_fingerprint({"embedding_model": "all-MiniLM-L6-v2"})
+    assert base != ingest.embedding_fingerprint({"embedding_model": "bge-m3"})
+
+
+def test_classify_reembeds_when_the_embedding_model_changes():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3,
+              "embedding_model": "bge-m3"}
+    entry = {"status": ingest.INDEXED, "embedding_fingerprint": "oldmodel1234"}
+
+    changes = ingest.classify(entries(("a.txt", "h1", entry)), entries(("a.txt", "h1", entry)),
+                              config, True)
+
+    assert changes[0]["type"] == ingest.MODIFIED
+    assert "embedding model changed" in changes[0]["reason"]
+
+
+def test_classify_keeps_files_when_the_embedding_model_is_unchanged():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3,
+              "embedding_model": "bge-m3"}
+    entry = {"status": ingest.INDEXED, "embedding_fingerprint": ingest.embedding_fingerprint(config)}
+
+    changes = ingest.classify(entries(("a.txt", "h1", entry)), entries(("a.txt", "h1", entry)),
+                              config, True)
+
+    assert changes[0]["type"] == ingest.UNCHANGED
+
+
+def test_classify_does_not_reembed_without_the_embedding_stack():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3,
+              "embedding_model": "bge-m3"}
+    entry = {"status": ingest.INDEXED, "embedding_fingerprint": "oldmodel1234"}
+
+    changes = ingest.classify(entries(("a.txt", "h1", entry)), entries(("a.txt", "h1", entry)),
+                              config, False)
+
+    assert changes[0]["type"] == ingest.UNCHANGED, "no re-embed loop while deps are missing"
+
+
+def test_scan_backfills_an_embedding_fingerprint(tmp_path):
+    """A manifest written before the field existed must not trigger a full re-embed."""
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})
+    config = yaml.safe_load(write_config(tmp_path, corpus).read_text(encoding="utf-8"))
+    stat = (corpus / "a.txt").stat()
+    previous = {"a.txt": {"content_hash": "h1", "status": ingest.INDEXED,
+                           "size": stat.st_size, "mtime": stat.st_mtime, "root": str(corpus)}}
+
+    current, _ = ingest.scan_sources(config, previous, full_hash=False)
+
+    assert current["a.txt"]["status"] == ingest.INDEXED
+    assert current["a.txt"]["embedding_fingerprint"] == ingest.embedding_fingerprint(config)
+
+
 # --------------------------------------------------------------------------
 # End-to-end runs
 # --------------------------------------------------------------------------
@@ -1533,6 +1588,32 @@ def test_manifest_records_hash_status_and_page_metadata(tmp_path, store):
     assert entry["attempts"] == 0
     assert entry["last_processed"].endswith("+00:00")
     assert entry["root"] == str(corpus)
+    assert entry["embedding_fingerprint"] == ingest.embedding_fingerprint(
+        yaml.safe_load(config.read_text(encoding="utf-8")))
+
+
+def test_changing_the_embedding_model_reembeds_the_corpus(tmp_path, store):
+    collection, counters = store
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})
+    config = write_config(tmp_path, corpus)
+
+    run(config)
+    embedded = counters["embedded"]
+    chunk_count = collection.count()
+
+    update_config(config, embedding_model="other-model")
+    run(config)
+
+    entry = scrap(config, "a.txt")
+    assert entry["status"] == ingest.INDEXED
+    assert entry["embedding_fingerprint"] == ingest.embedding_fingerprint(
+        yaml.safe_load(config.read_text(encoding="utf-8")))
+    assert counters["embedded"] > embedded, "the chunks must be re-embedded"
+    assert collection.count() == chunk_count, "chunk ids are stable, so no duplicates"
+
+    embedded = counters["embedded"]
+    run(config)                       # settled again: nothing more to re-embed
+    assert counters["embedded"] == embedded
 
 
 # --------------------------------------------------------------------------

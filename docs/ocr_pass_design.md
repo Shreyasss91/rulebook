@@ -331,7 +331,8 @@ Landed in `scripts/incremental_ingest.py` with a test section in `tests/test_inc
 - **Fingerprint** — `ocr_fingerprint()` hashes backend, dpi, languages, per-page threshold,
   escalation threshold, the API endpoint/model **and the names of the usable engines**, so adding a
   Novita key (or pointing `ocr_api_url`/`ocr_api_model` at a different service) re-visits pages that
-  were only read by the previous setup. `SCHEMA_VERSION` is now 2 (older manifests load fine).
+  were only read by the previous setup. This bumped `SCHEMA_VERSION` to 2 (older manifests load fine;
+  it is 3 as of the embedding guard-rail in `docs/stack_choices.md`).
 - **Settling rule** — the fingerprint is written only when candidates existed, none were left
   behind, and no engine failed (`attempted and not incomplete and not errors and not fatal`). A run
   cut short by `--ocr-limit`/`ocr_max_pages_per_file`, or one where an engine errored on a page,

@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Embedding-model guard-rail** (`scripts/incremental_ingest.py`) — the manifest now records
+  `embedding_fingerprint` (a hash of `embedding_model`), and `classify()` re-processes an indexed
+  file whose fingerprint differs (`re-embed: the embedding model changed`). Before this, swapping the
+  model left every file `UNCHANGED`, so nothing re-embedded and the query CLI would silently pair a
+  new-model query with old-model vectors (`docs/stack_choices.md` §3.4). A manifest from before the
+  field existed is adopted as embedded with the current model on its first run, so upgrading does not
+  re-embed the corpus; `SCHEMA_VERSION` is now 3. The fingerprint is written only on a successful
+  index, so a `pending_embedding` file is never marked embedded
+- Tests for the guard-rail: fingerprint stability, re-embed on a model change, no churn when the
+  model is unchanged, no re-embed loop while the embedding stack is missing, the scan-time backfill,
+  and an end-to-end re-embed run that keeps chunk ids stable (no duplicates)
 - **RAG query CLI** (`scripts/query_cli.py`, design in `docs/query_cli_design.md`) — answers questions
   over the collection `incremental_ingest.py` wrote, with page-exact citations (the v1.0.0 milestone):
   - **Retrieval** reuses `chroma_path`/`collection_name`/`embedding_model`, converts Chroma's cosine
@@ -421,7 +432,7 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 31 |
+| **Commits** | 33 |
 | **Documents** | 9 markdown files (7 in `docs/`, 2 at root) |
 | **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |

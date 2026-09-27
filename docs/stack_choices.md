@@ -157,19 +157,16 @@ should pick between:
   a small Kannada retrieval spike on ~20 real queries, mirroring how `docs/ocr_pass_design.md` keeps
   a spike as rollout step 1.
 
-**The re-index trap (a real gap in the current design).** `incremental_ingest.py` keys change
-detection on the file's `content_hash`; nothing in the manifest records **which embedding model**
-produced the chunks. Changing `embedding_model` in `config.yaml` therefore leaves every file
-`UNCHANGED` and **nothing is re-embedded** — the query CLI would silently mix a new query embedder
-with old-model vectors. Before any switch, either:
-
-1. add an `embedding_fingerprint` (model name + dimensions) to the manifest and re-process when it
-   changes — the same mechanism `ocr_fingerprint` already uses; or
-2. bump `collection_name` (e.g. `kerc_docs_multi`) and run a clean full ingest into the new
-   collection, keeping the old one intact for comparison.
-
-Option 2 is the safer first migration; option 1 is the durable fix and is recommended regardless of
-which model is chosen.
+**The re-index trap — now guarded.** `incremental_ingest.py` keys change detection on the file's
+`content_hash`, which cannot change when *only* the embedder changes; nothing used to record **which
+embedding model** produced the chunks, so editing `embedding_model` left every file `UNCHANGED` and
+re-embedded nothing — the query CLI would silently mix a new-model query with old-model vectors.
+The manifest now stores an `embedding_fingerprint` (a hash of the model name), and `classify()`
+re-processes an indexed file whose fingerprint differs (`re-embed: the embedding model changed`),
+the same mechanism `ocr_fingerprint` uses. A manifest written before the field existed is adopted as
+embedded with the current model on its first run, so upgrading does not re-embed the corpus; **if the
+model was changed before that first run, do a clean re-index** into a new `collection_name`
+(e.g. `kerc_docs_multi`) instead.
 
 ## 4. Decision summary
 
@@ -177,7 +174,7 @@ which model is chosen.
 |-----------|-----|----------------|--------------|
 | Vector DB | ChromaDB (embedded, HNSW, metadata filters) | **Keep** | Hybrid/keyword search or >1M chunks → LanceDB; multi-writer → Qdrant |
 | Embeddings | `all-MiniLM-L6-v2` (English) | **Upgrade to a multilingual model** (`multilingual-e5-small` first, `BGE-M3`-class target) | As soon as a Kannada retrieval spike confirms the gain; pair with a full re-index |
-| Guard-rail | manifest has no embedding fingerprint | Add `embedding_fingerprint`, or migrate via a new `collection_name` | Before the embedding switch |
+| Guard-rail | `embedding_fingerprint` in the manifest re-embeds the corpus when the model changes | **Implemented**; use a new `collection_name` only if the model was swapped before the guard landed | — |
 
 Neither change touches a contract the query layer depends on (`source`/`page`/`section` metadata),
 so citations survive either migration — only the vector space is rebuilt.

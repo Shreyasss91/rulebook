@@ -106,9 +106,10 @@ except ImportError:
     ocrmypdf = None
 
 
-SCHEMA_VERSION = 2  # v2 adds the OCR fields (ocr_fingerprint, ocr_pages, ocr_pdf_*)
+SCHEMA_VERSION = 3  # v3 adds embedding_fingerprint (v2 added the ocr_* fields)
 HASH_CHARS = 16
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 # Office owner/lock files (~$Doc.docx from Word/Excel, .~lock.Doc.odt# from
 # LibreOffice/OpenOffice) are transient artefacts created while a document is open:
@@ -163,6 +164,9 @@ OCR_AVAILABLE = False
 CARRIED_FIELDS = ("content_hash", "signature", "page_count", "has_text_layer",
                   "pages_without_text", "chunk_count", "status", "last_processed",
                   "attempts", "note",
+                  # The embedding model a file's vectors were produced with, so a
+                  # model change can re-embed it (the content hash cannot show this).
+                  "embedding_fingerprint",
                   # OCR results: the settings the file was assessed under and what
                   # came out of it, so a move does not look like it was never OCR'd.
                   "ocr_fingerprint", "ocr_pages", "ocr_pdf_hash", "ocr_pdf_fingerprint")
@@ -359,6 +363,14 @@ def scan_sources(config: dict, previous: dict, full_hash: bool) -> tuple[dict, d
                 # Carry previous results forward so unchanged files stay untouched and
                 # unfinished ones keep the status the retry logic looks at.
                 entry.update({key: prev.get(key) for key in CARRIED_FIELDS})
+
+            # A manifest written before embedding fingerprints existed is adopted as
+            # embedded with the current model: this project has only ever used one, and
+            # assuming a mismatch would re-embed the whole corpus on the first run after
+            # this lands. Changing the model *before* that first run therefore cannot be
+            # detected - do a clean re-index in that case (see docs/stack_choices.md).
+            if entry.get("status") == INDEXED and not entry.get("embedding_fingerprint"):
+                entry["embedding_fingerprint"] = embedding_fingerprint(config)
 
             unchanged_stat = prev is not None and not full_hash and (
                 prev.get("size") == stat.st_size and prev.get("mtime") == stat.st_mtime
@@ -981,13 +993,14 @@ def ensure_searchable_pdf(rel: str, source: Path, entry: dict, config: dict,
 # --------------------------------------------------------------------------
 
 def needs_reprocessing(prev_entry: dict, can_embed: bool, max_retries: int,
-                       ocr: dict | None = None, rel: str = "") -> str | None:
+                       ocr: dict | None = None, rel: str = "",
+                       embedding_fp: str | None = None) -> str | None:
     """
     Return a reason to re-process a file whose content is unchanged, else None.
 
     `ocr` carries the run's OCR context ({"available": bool, "fingerprint": str}) and
     defaults to the module-level OCR_AVAILABLE flag, so direct callers and tests keep
-    working without one.
+    working without one. `embedding_fp` is the run's current embedding fingerprint.
     """
     ocr = ocr or {}
     ocr_available = bool(ocr.get("available", OCR_AVAILABLE))
@@ -1011,6 +1024,12 @@ def needs_reprocessing(prev_entry: dict, can_embed: bool, max_retries: int,
             and prev_entry.get("pages_without_text")
             and prev_entry.get("ocr_fingerprint") != fingerprint):
         return "ocr: pages with no text layer not yet recovered"
+    # Vectors produced by a different model cannot be queried by the current one, and
+    # only a re-embed fixes that. Needs the embedding stack, or it would loop forever.
+    if (can_embed and status == INDEXED and embedding_fp
+            and prev_entry.get("embedding_fingerprint")
+            and prev_entry["embedding_fingerprint"] != embedding_fp):
+        return "re-embed: the embedding model changed"
     if status in RETRYABLE and can_embed:
         return f"retry: previous run ended in {status}"
     return None
@@ -1021,6 +1040,7 @@ def classify(current: dict, previous: dict, config: dict, can_embed: bool,
     track_moves = config.get("track_moves", True)
     track_deletions = config.get("track_deletions", True)
     max_retries = config.get("max_retries", DEFAULT_MAX_RETRIES)
+    embedding_fp = embedding_fingerprint(config)
 
     # Paths that vanished, grouped by content hash so a move can be recognised.
     vanished = {path: entry for path, entry in previous.items() if path not in current}
@@ -1051,7 +1071,7 @@ def classify(current: dict, previous: dict, config: dict, can_embed: bool,
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev})
             continue
 
-        reason = needs_reprocessing(prev, can_embed, max_retries, ocr, rel)
+        reason = needs_reprocessing(prev, can_embed, max_retries, ocr, rel, embedding_fp)
         if reason:
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev,
                             "reason": reason})
@@ -1305,11 +1325,25 @@ def make_chunk_id(rel_path: str, content_hash: str, index: int) -> str:
 # Embeddings + vector store
 # --------------------------------------------------------------------------
 
+def embedding_fingerprint(config: dict) -> str:
+    """
+    Identity of the embedding model a file's vectors were produced with.
+
+    Stored in the manifest so a model change re-embeds the corpus. Swapping
+    `embedding_model` alters both the vector space *and* its dimension, which the
+    file's content hash cannot express: without this the classifier would report
+    every file UNCHANGED and retrieval would silently mix two vector spaces (a
+    new-model query against old-model chunks).
+    """
+    model = str(config.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+    return hashlib.sha1(model.encode()).hexdigest()[:12]
+
+
 class Embedder:
     """Lazy sentence-transformers wrapper - the model is only loaded when needed."""
 
     def __init__(self, config: dict) -> None:
-        self.model_name = config.get("embedding_model", "all-MiniLM-L6-v2")
+        self.model_name = config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
         self.batch_size = config.get("embedding_batch_size", 32)
         self._model = None
 
@@ -1562,6 +1596,9 @@ def apply_one_change(change: dict, config: dict, previous: dict, current: dict, 
         entry["attempts"] = entry.get("attempts", 0) + 1
     else:
         entry["attempts"] = 0
+    if status == INDEXED:
+        # Record the model that produced these vectors, so a later change re-embeds.
+        entry["embedding_fingerprint"] = embedding_fingerprint(config)
     if note:
         entry["note"] = note
     else:

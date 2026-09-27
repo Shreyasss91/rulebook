@@ -174,6 +174,9 @@ lock_file_patterns:
   - "~$*"
   - ".~lock.*#"
 
+# Embeddings — changing embedding_model re-embeds the corpus (embedding_fingerprint)
+embedding_model: "all-MiniLM-L6-v2"
+
 # Query CLI (scripts/query_cli.py) — reads the same collection
 llm_backend: "ollama"          # ollama (local, default) | claude | none
 llm_top_k: 6                   # excerpts per question
@@ -250,6 +253,11 @@ dedup signature, page count, chunk count and status per file. Per change type:
   - `ocrmypdf --skip-text` mirrors only the files that actually have OCR text into `ocr_pdf_path`
     (best-effort; a missing Ghostscript is a note, not a failure).
   - `--dry-run`/`--audit`/`--no-ocr` never build an engine, so they cannot spend money.
+- **Embedding guard-rail**: every indexed entry stores an `embedding_fingerprint` (a hash of
+  `embedding_model`). Changing the model re-processes all indexed files (`re-embed: the embedding
+  model changed`), because the content hash cannot show that the vector space changed. A manifest
+  from before the field existed is adopted as embedded with the current model, so upgrading does not
+  re-embed the corpus; `SCHEMA_VERSION` is 3. Read `docs/stack_choices.md` before switching models.
 - Extraction coverage: `.pdf` (pdfplumber), `.docx` (python-docx), `.txt`/`.md`, spreadsheets
   (`.xlsx`/`.xlsm` via openpyxl, `.xls` via xlrd, `.csv` via stdlib). A missing library or an
   unimplemented format yields `unsupported` with the reason, never a crash — `.doc` and `.rtf` are

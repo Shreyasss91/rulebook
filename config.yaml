@@ -54,6 +54,9 @@ chunk_overlap: 200         # characters carried from the previous chunk
 min_chunk_chars: 200       # shorter chunks are merged into their neighbour
 
 # Embeddings + vector store (sentence-transformers / chromadb must be installed)
+# Changing embedding_model changes the vector space, so the manifest's
+# embedding_fingerprint makes the next ingest re-embed every indexed file.
+# See docs/stack_choices.md before switching to a multilingual model.
 embedding_model: "all-MiniLM-L6-v2"
 embedding_batch_size: 32
 chroma_path: "kerch_db"
