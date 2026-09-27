@@ -82,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not affected)
 
 ### Documentation
+- **`docs/stack_choices.md` §5 expanded** — the "similar analysis for other stack entries" is now full
+  pros/cons, each with a recommendation and a change trigger: text extraction (`pdfplumber` vs
+  PyMuPDF/Docling/pypdf/hosted), chunking (legal-aware vs fixed/semantic/hierarchical/late/contextual),
+  retrieval mode (dense+`$contains` vs hybrid BM25+RRF vs reranking), the answer LLM (Ollama vs Claude
+  vs hosted vs extractive), orchestration (plain Python vs LangChain/LlamaIndex/Haystack/DSPy) and the
+  UI (CLI vs Gradio/Streamlit/Chainlit). Each keeps the current choice and notes what would change it
 - **`docs/stack_choices.md`** — the deferred stack analysis: pros/cons for the vector DB (ChromaDB
   vs LanceDB/Qdrant/sqlite-vec/FAISS/pgvector and the hosted category) and for embeddings (current
   `all-MiniLM-L6-v2` vs `multilingual-e5`, BGE-M3, Nomic v2, EmbeddingGemma, Qwen3-Embedding, LaBSE

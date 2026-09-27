@@ -23,9 +23,9 @@ PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector
 - **Chunking**: Legal-aware (preserves rule/section numbering)
 - **Config**: YAML-driven (`config.yaml`)
 
-Stack options (Vector DB, Embeddings) with pros/cons, the bilingual-retrieval gap and the re-index
-migration plan live in `docs/stack_choices.md` — read it before changing `embedding_model` or
-`collection_name`.
+Stack options with pros/cons, the bilingual-retrieval gap and the re-index migration plan live in
+`docs/stack_choices.md` (Vector DB and embeddings in §2–§3, the other entries in §5) — read it before
+changing `embedding_model`, `collection_name` or a pipeline component.
 
 ## Repository Layout
 
@@ -64,7 +64,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → OCR → chunk → embed → ChromaDB upsert |
 | `scripts/query_cli.py` | Query CLI: embed question → vector search → cited answer (Ollama/Claude/extractive) |
 | `docs/query_cli_design.md` | Query CLI design: retrieval, page-exact citations, LLM backends, failure modes |
-| `docs/stack_choices.md` | Vector DB + embedding options with pros/cons, the Kannada gap, and the re-index migration plan |
+| `docs/stack_choices.md` | Pros/cons and recommendations for the whole stack — Vector DB, embeddings, extraction, chunking, retrieval, LLM, orchestration, UI |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
 | `docs/ocr_pass_design.md` | OCR pass design, decision log and implementation notes; runs inside `scripts/incremental_ingest.py` |

@@ -179,19 +179,116 @@ model was changed before that first run, do a clean re-index** into a new `colle
 Neither change touches a contract the query layer depends on (`source`/`page`/`section` metadata),
 so citations survive either migration — only the vector space is rebuilt.
 
-## 5. Similar analysis for the other stack entries
+## 5. Analysis for the other stack entries
 
-Brief, because each is already decided in code or a design doc:
+The deferred item asked for the same treatment of the entries around the two above. Each is shorter
+because the project has already exercised the choice and a design doc records it; the summary table is
+in §5.8.
 
-| Entry | Chosen | Why / where it is recorded | Open question |
-|-------|--------|----------------------------|---------------|
-| PDF extraction | `pdfplumber` | Handles tables/structure; measured in `docs/incremental_update_strategy.md` | `pymupdf` is faster but AGPL — a licensing, not quality, call |
-| OCR | Tesseract + Novita DeepSeek OCR 2 hybrid, page-level | `docs/ocr_pass_design.md`, incl. the decision log and cost controls | Confirm the Novita model string in the spike (§11 step 1) |
-| Chunking | Custom legal-aware, page-bounded | `docs/incremental_update_strategy.md`; keeps rule/section headings and exact pages | 1200-char target vs. embedder token window (see §3) |
-| Vector DB | ChromaDB | §2 | Hybrid/keyword support |
-| Embeddings | `all-MiniLM-L6-v2` | §3 | Multilingual upgrade |
-| LLM | Ollama local (default), Claude optional | `docs/query_cli_design.md` | Model size for 8 GB; bilingual answer quality in Kannada |
-| Orchestration | **None — plain Python** (no LangChain/LlamaIndex) | Keeps the pipeline debuggable and dependency-light; the original sketch suggested a framework | Revisit only if agentic/multi-step retrieval is added |
+### 5.1 Text extraction
+
+| Option | License | Speed | Strengths | Weaknesses | Fit |
+|--------|---------|-------|-----------|------------|-----|
+| **pdfplumber** *(current)* | MIT | slow (~10–50× PyMuPDF) | Reliable text + table geometry, per page; already measured on the whole corpus | Slow across 25k pages; no layout → Markdown | **Keep** |
+| **PyMuPDF (fitz)** | **AGPL** / commercial | very fast (C engine) | Fastest extraction and rendering | The AGPL licence is a real decision for a government tool | Candidate if speed ever hurts |
+| **pypdf** | BSD | fast | Simple, maintained | Spacing artifacts, weak tables | No gain over pdfplumber |
+| **Docling** (IBM) | MIT | slower | Layout/reading order → structured Markdown, table structure | Newer and heavier; changes chunk shape → full re-index | Only if layout quality becomes the bottleneck |
+| **Unstructured / LlamaParse / Reducto** | mixed / paid | — | Strong parsing | Hosted ones send documents off the machine (they appear in the AI service catalog) | Rejected by local-first |
+| OCR fallback | — | — | Handles scans | Owned by `docs/ocr_pass_design.md` | — |
+
+**Recommendation: keep `pdfplumber`.** Extraction is already measured (about 75 min for the whole
+corpus, `docs/kerc_folder_inventory.md`) and licence-clean. A need for layout-preserving Markdown is
+the one reason to move — to Docling — and that is a re-index, not a drop-in swap.
+
+### 5.2 Chunking
+
+| Strategy | How | Pros | Cons | Fit |
+|----------|-----|------|------|-----|
+| **Legal-aware, page-bounded** *(current)* | a heading regex opens a block; chunks never span a page; runts merge into a neighbour | Exact page citations survive; rule/section headings stay with their text; deterministic and testable without a model | Hand-tuned regex; a fixed 1200-char target can exceed an embedder's token window | **Keep** |
+| Fixed-size / recursive | split every N characters or tokens | Trivial, the framework default | Cuts across rule boundaries and fragments citations | No — wrong for legal text |
+| Semantic chunking | split where embedding similarity shifts | Coherent chunks | An extra model + compute per document; non-deterministic; harder to test | Only if retrieval quality plateaus |
+| Hierarchical / parent-document | retrieve small chunks, hand the LLM their larger parent | Precise match *and* more context | Two-level store; the parent must be reconstructable from the source | Good future option |
+| Late chunking | embed the whole document, then pool chunk spans | Context-rich chunk vectors | Needs a long-context embedder and a re-index; new tooling | Pairs with the multilingual upgrade |
+| Contextual retrieval (LLM-written chunk prefixes) | prepend a generated context line per chunk | Large published recall gains | An LLM call per chunk (~37k, even local) plus a re-index | Too costly at this corpus size for now |
+
+**Recommendation: keep the custom legal-aware chunker.** It is the part of the stack that makes
+page-exact citation possible, and it is deterministic (so the suite tests it without a model). The
+open item is the 1200-char target versus a model's token window: at ~300 English tokens it is safe,
+but Kannada is token-denser and worth measuring before the multilingual switch.
+
+### 5.3 Retrieval mode
+
+| Mode | Pros | Cons | Fit |
+|------|------|------|-----|
+| **Dense + `$contains`** *(current)* | One index, simple; the substring filter already covers exact rule numbers | Misses lexical matches beyond the exact-substring case | **Keep for v1** |
+| Hybrid (dense + BM25/sparse, fused with RRF) | Best recall for rule numbers, names and numbers | Needs a sparse index (LanceDB / Qdrant / BGE-M3 sparse) or a hand-rolled BM25 | The clearly next retrieval step |
+| Cross-encoder reranking | Highest precision on the retrieved top-k | A second model on every query (CPU latency), more dependencies | Optional once hybrid lands |
+| Query rewriting / HyDE | Helps vague questions | An extra LLM call per query | Only with an LLM already in the loop |
+| Long-context "stuff whole sections" | No retrieval failure mode | Blows an 8 GB machine's context budget | No |
+
+**Recommendation:** keep dense + `$contains` for v1. Hybrid and reranking belong to the same milestone
+as the embedder/vector-DB decision in §2–§3, so the corpus is re-indexed once rather than twice.
+
+### 5.4 Answer generation (LLM)
+
+| Option | Cost | Privacy | Notes | Fit |
+|--------|------|---------|-------|-----|
+| **Ollama (local)** *(current default)* | $0 | 100% local | ~3B–8B models fit 8 GB; quality is the limit, not availability | **Keep as default** |
+| Claude API | per token | data egress | Best reasoning; one config line (`llm_backend: claude`) | Optional, per question |
+| Other hosted (Groq, Together, Fireworks, Bedrock, Vertex, OpenRouter, …) | per token | data egress | The AI service catalog is almost entirely hosted inference | Rejected by local-first |
+| Extractive (no LLM) | $0 | local | Already implemented (`--no-llm`); the floor when no engine runs | Keep as the fallback |
+
+Local model size is the real open question on the reference 8 GB machine: 3B models are comfortable,
+7–8B quantized are tight, and the frontier sizes in 2026 rankings do not fit. **Recommendation: keep a
+small local default (`llama3.2:3b`) and let `llm_backend: claude` cover the hard questions** — the CLI
+degrades to cited extractive answers either way.
+
+### 5.5 OCR
+
+Already analysed **and implemented**: see `docs/ocr_pass_design.md` for the engine comparison, the
+hybrid decision, the cost controls and the rollout. Nothing to add here beyond the pointer.
+
+### 5.6 Orchestration
+
+| Option | Pros | Cons | Fit |
+|--------|------|------|-----|
+| **Plain Python** *(current)* | No framework churn; the pipeline is debuggable and unit-tested with no model; tiny dependency set | You own retries, tracing and evaluation | **Keep** |
+| LangChain / LangGraph | Huge ecosystem, integrations, agents, tool use | Large dependency tree, fast-moving APIs; single-shot Q&A needs no agent | Only if agentic flows arrive |
+| LlamaIndex | Strongest retrieval/document abstractions and ingestion pipelines | Duplicates the custom ingest that already works; another large dependency | Only if ingestion is replaced |
+| Haystack | Strong search pipelines and evaluation | Similar cost/benefit | No current need |
+| DSPy | Optimises prompts/retrieval programmatically | Needs labelled data and compute to tune | Interesting once evaluation data exists |
+
+The original sketch (`docs/origin_doc.md`) suggested LangChain or LlamaIndex, and the project
+consciously went its own way: **stay on plain Python.** The differentiators — legal-aware chunking and
+page-exact citations — are custom, and a framework would wrap them without improving them while adding
+dependencies the test suite deliberately avoids. Revisit only when multi-step / agentic retrieval is
+wanted, where LangGraph's orchestration earns its cost.
+
+### 5.7 UI
+
+| Option | Pros | Cons | Fit |
+|--------|------|------|-----|
+| **CLI** *(current)* | Built (`scripts/query_cli.py`), scriptable, `--json` | Not approachable for non-developers | Keep as the interface of record |
+| **Gradio** | Fastest path to a chat UI: streaming, file upload, runs locally | Less flexible layout; citation HTML needs care | **Planned (v1.1.0)** |
+| Streamlit | Polished, flexible layout | Rerun model is awkward for chat; heavier | Alternative if Gradio limits |
+| Chainlit | Purpose-built conversational UI; citations/steps built in | Another dependency; less general-purpose | Strong contender; evaluate against Gradio |
+| FastAPI + custom front-end | Full control | You build and maintain a front-end | Only if the UI becomes a product |
+| Existing tools (AnythingLLM, Kotaemon, PrivateGPT) | No code to write | They own the chunking/OCR/citation format — the point of Option A | Already rejected in `docs/origin_doc.md` |
+
+**Recommendation: Gradio for v1.1.0** as planned, with the query logic kept in the CLI/library and the
+UI a thin adapter, so the choice stays reversible.
+
+### 5.8 Decision summary — other entries
+
+| Entry | Now | Recommendation | Changes when |
+|-------|-----|----------------|--------------|
+| Text extraction | `pdfplumber` | **Keep** | Layout-preserving Markdown is needed → Docling (re-index) |
+| Chunking | Custom legal-aware, page-bounded | **Keep** | A long-context/parent-document need appears |
+| Retrieval mode | Dense + `$contains` | **Keep for v1** | Decide hybrid/rerank together with the embedder switch (§3) |
+| Answer LLM | Ollama local (default), Claude optional | **Keep**; small local model + Claude for hard questions | Latency/quality demands a bigger model |
+| Orchestration | Plain Python | **Keep** | Multi-step/agentic retrieval is added |
+| UI | CLI | **Gradio (v1.1.0)** | Gradio's limits are hit → Chainlit/Streamlit |
+| OCR | Tesseract + Novita hybrid | See `docs/ocr_pass_design.md` | — |
 
 ## 6. References
 
@@ -203,4 +300,18 @@ Brief, because each is already decided in code or a design doc:
   "Top 10 Multilingual Embedding Models for RAG" (2026-02-20).
 - Kannada embedding quality (nomic v2 MoE / Arctic Embed 2 / BGE-M3 / OpenAI): thejeshgn —
   "Embedding models for Kannada" (2025-06-18).
+- PDF parser comparisons (PyMuPDF speed vs pdfplumber tables; the AGPL licence): nutrient.io —
+  "Python PDF library comparison (2026)" (2026-04-16); subhajitbhar.com — "pdfplumber vs PyMuPDF vs
+  pypdf" (2026-09-01).
+- Chunking strategies (recursive default, semantic, hierarchical, late chunking): firecrawl.dev —
+  "Best Chunking Strategies for RAG" (2026-02-24); arxiv.org/html/2603.06976v1 — "A Systematic
+  Investigation of Document Chunking" (2026-03-07).
+- RAG frameworks (LangChain/LangGraph orchestration, LlamaIndex retrieval, Haystack, DSPy):
+  aimultiple.com — "RAG Frameworks" benchmark; iternal.ai — "Best RAG Framework 2026" (2026-09-05).
+- Local LLM sizing (3B–8B fit 8 GB; frontier sizes do not): omidsaffari.com — "Best Local LLMs 2026"
+  (2026-08-09); daily.dev — "The Best Local LLM Models to Run in 2026" (2026-06-22).
+- Python UI frameworks for AI apps (Gradio / Streamlit / Chainlit): getstream.io — "The 3 Best Python
+  Frameworks To Build UIs for AI Apps"; heyclau.de — "ML & AI app UI frameworks compared".
+- AI service catalog consulted for hosted options (inference and parsing): the Gravity Index `AI`
+  category — almost entirely hosted services, which is why local-first rules them out.
 - Original project stack and hardware: `docs/origin_doc.md`.
