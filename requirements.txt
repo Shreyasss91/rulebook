@@ -1,9 +1,10 @@
 # KERC RAG — Python dependencies
 # Install:  pip install -r requirements.txt
 #
-# Only the active block is installed by default. Planned blocks stay commented
-# (mirroring the priority tiers in config.yaml) so a fresh install works today
-# without pulling OCR/vector-DB stacks that no script uses yet.
+# Only the active block is installed by default. Optional/planned blocks stay
+# commented (mirroring the priority tiers in config.yaml) so a fresh install
+# works today without pulling the embedding, vector-DB or OCR stacks; the
+# ingest script enables each capability when its dependency is available.
 
 # --- Active: required by scripts/ today ---------------------------------
 pyyaml>=6.0                # config.yaml loading (scan_extensions.py, dedup script)
@@ -29,9 +30,12 @@ xlrd>=2.0.1                # legacy .xls worksheets (xlrd 2.x reads .xls only)
 # sentence-transformers>=2.7.0   # all-MiniLM-L6-v2 embeddings (local, CPU)
 # chromadb>=0.4.24               # persistent local vector store (kerch_db/)
 
-# --- Planned: OCR fallback ----------------------------------------------
-# These wrappers also need native binaries installed separately (Tesseract for
-# pytesseract; Tesseract + Ghostscript for ocrmypdf), so they are excluded from
-# the default install.
+# --- Optional: turns on the OCR pass of incremental_ingest.py -----------
+# Imported lazily. pytesseract drives the free local Tesseract engine (it also
+# needs the Tesseract binary, and the `kan` traineddata for ocr_languages
+# "eng+kan", installed separately); ocrmypdf produces the searchable-PDF
+# artefact (it also needs Ghostscript). Without them a run still extracts,
+# chunks and indexes, and scanned files simply stay `needs_ocr` (or lose only
+# the artefact); the Novita API engine is pure stdlib and needs just a key.
 # pytesseract>=0.3.10
 # ocrmypdf>=16.0.0

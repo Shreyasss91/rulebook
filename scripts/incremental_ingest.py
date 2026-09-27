@@ -39,13 +39,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
 import sys
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,8 +93,20 @@ try:
 except ImportError:
     xlrd = None
 
+# OCR engines are optional and need native binaries/credentials of their own; a
+# missing one is a capability gap (files stay needs_ocr), never a crash.
+try:
+    import pytesseract  # needs the Tesseract binary + language data installed
+except ImportError:
+    pytesseract = None
 
-SCHEMA_VERSION = 1
+try:
+    import ocrmypdf  # needs Ghostscript; only used for the searchable-PDF artefact
+except ImportError:
+    ocrmypdf = None
+
+
+SCHEMA_VERSION = 2  # v2 adds the OCR fields (ocr_fingerprint, ocr_pages, ocr_pdf_*)
 HASH_CHARS = 16
 DEFAULT_MAX_RETRIES = 3
 
@@ -100,6 +115,29 @@ DEFAULT_MAX_RETRIES = 3
 # they hold no real content and disappear with the application. They are skipped at
 # scan time instead of being retried as `error` (see lock_file_patterns in config.yaml).
 DEFAULT_LOCK_FILE_PATTERNS = ("~$*", ".~lock.*#")
+
+# OCR backends. `hybrid` runs Tesseract first and escalates pages it could not read
+# to Novita; the others pin a single engine. See docs/ocr_pass_design.md.
+OCR_OFF = "none"
+OCR_TESSERACT = "tesseract"
+OCR_NOVITA = "novita"
+OCR_HYBRID = "hybrid"
+DEFAULT_OCR_BACKEND = OCR_HYBRID
+DEFAULT_OCR_LANGUAGES = "eng+kan"
+DEFAULT_OCR_DPI = 300
+DEFAULT_OCR_ESCALATE_BELOW_CHARS = 200
+DEFAULT_OCR_MAX_PAGES_PER_FILE = 500
+DEFAULT_OCR_API_URL = "https://api.novita.ai/v3/openai/chat/completions"
+DEFAULT_OCR_API_MODEL = "deepseek/deepseek-ocr-2"
+DEFAULT_OCR_API_KEY_ENV = "NOVITA_API_KEY"
+DEFAULT_OCR_API_COST_PER_PAGE = 0.0001     # Novita DeepSeek OCR 2, upper estimate
+OCR_API_PROMPT = (
+    "Transcribe every character on this scanned document page verbatim, in "
+    "{languages} where present. Output plain text only: no commentary, no markdown "
+    "fences. Preserve line breaks and rule/section numbering."
+)
+# A page counts as having no text layer below this many characters.
+BLANK_PAGE_CHARS = 10
 
 # Change types
 NEW, MODIFIED, MOVED, DELETED, UNCHANGED = "NEW", "MODIFIED", "MOVED", "DELETED", "UNCHANGED"
@@ -116,14 +154,18 @@ ERROR = "error"
 # becomes available again.
 RETRYABLE = {NEEDS_OCR, PENDING_EMBEDDING, ERROR}
 
-# OCR is not implemented yet (see Next Milestones). Flip this to True when the OCR
-# pipeline lands and files marked needs_ocr start being retried automatically.
+# Fallback used only when no explicit OCR context is supplied (direct calls and
+# tests). Real runs compute availability from config + installed engines in main()
+# and pass it through classify(), so this default never enables OCR by itself.
 OCR_AVAILABLE = False
 
 # Manifest entry fields that survive from the previous run.
 CARRIED_FIELDS = ("content_hash", "signature", "page_count", "has_text_layer",
                   "pages_without_text", "chunk_count", "status", "last_processed",
-                  "attempts", "note")
+                  "attempts", "note",
+                  # OCR results: the settings the file was assessed under and what
+                  # came out of it, so a move does not look like it was never OCR'd.
+                  "ocr_fingerprint", "ocr_pages", "ocr_pdf_hash", "ocr_pdf_fingerprint")
 
 # Block-level split points for legal text: rule/section headings, all-caps
 # titles, and numbered clauses keep their own block so citations stay exact.
@@ -382,24 +424,600 @@ def nested_source_pairs(sources: list[str]) -> list[tuple[str, str]]:
 
 
 # --------------------------------------------------------------------------
+# OCR pass
+# --------------------------------------------------------------------------
+
+def combine_notes(*notes: str | None) -> str | None:
+    """Join non-empty notes for the manifest, or None so stale notes are cleared."""
+    return "; ".join(note for note in notes if note) or None
+
+
+class OcrEngine:
+    """One OCR backend. `available()` is cheap and is called once at start-up."""
+
+    name = "none"
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+
+    def available(self) -> bool:
+        return False
+
+    def ocr_image(self, image) -> str:
+        raise NotImplementedError
+
+
+class TesseractEngine(OcrEngine):
+    """Local Tesseract via pytesseract - free, needs the binary and language data."""
+
+    name = OCR_TESSERACT
+
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        self.languages = str(config.get("ocr_languages", DEFAULT_OCR_LANGUAGES))
+        self._available: bool | None = None
+
+    def wanted_languages(self) -> set[str]:
+        return {lang for lang in self.languages.split("+") if lang}
+
+    def _installed_languages(self) -> set[str]:
+        if pytesseract is None:
+            return set()
+        try:
+            # Requires the Tesseract binary; raises (TesseractNotFoundError or an
+            # OSError) when it is not installed, which is exactly the check we want.
+            return set(pytesseract.get_languages(config=""))
+        except Exception:
+            return set()
+
+    def missing_languages(self) -> list[str]:
+        return sorted(self.wanted_languages() - self._installed_languages())
+
+    def available(self) -> bool:
+        if self._available is not None:
+            return self._available
+        installed = self._installed_languages()
+        # Languages are strict: a missing pack must not silently fall back to
+        # English, which would garble the Kannada half of a mixed order.
+        self._available = bool(installed) and self.wanted_languages().issubset(installed)
+        return self._available
+
+    def ocr_image(self, image) -> str:
+        return pytesseract.image_to_string(image, lang=self.languages) or ""
+
+
+class NovitaEngine(OcrEngine):
+    """
+    Novita.ai DeepSeek OCR 2 over its OpenAI-compatible endpoint.
+
+    Only reached for pages Tesseract could not read (or when it is the only engine),
+    so paid calls stay on the hard pages. URL, model, key variable and timeout come
+    from config, so a model or endpoint change is a config edit, not a code change.
+    """
+
+    name = OCR_NOVITA
+
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        self.url = config.get("ocr_api_url", DEFAULT_OCR_API_URL)
+        self.model = config.get("ocr_api_model", DEFAULT_OCR_API_MODEL)
+        self.key_env = config.get("ocr_api_key_env", DEFAULT_OCR_API_KEY_ENV)
+        self.timeout = config.get("ocr_api_timeout", 60)
+        self.languages = str(config.get("ocr_languages", DEFAULT_OCR_LANGUAGES))
+
+    def api_key(self) -> str:
+        return os.environ.get(self.key_env, "").strip()
+
+    def available(self) -> bool:
+        return bool(self.api_key())
+
+    def payload(self, image) -> dict:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text",
+                     "text": OCR_API_PROMPT.format(languages=self.languages)},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                ],
+            }],
+        }
+
+    def ocr_image(self, image) -> str:
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(self.payload(image)).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.api_key()}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        return extract_api_text(body)
+
+
+def extract_api_text(body: dict) -> str:
+    """Pull the assistant text out of an OpenAI-compatible chat response."""
+    if not isinstance(body, dict):
+        return ""
+    try:
+        content = body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Some gateways return content as a list of parts.
+        return "".join(part.get("text", "") for part in content
+                       if isinstance(part, dict))
+    return ""
+
+
+def build_ocr_engines(config: dict) -> list[OcrEngine]:
+    """Engines for the configured backend, in priority order (primary, escalation)."""
+    backend = str(config.get("ocr_backend", DEFAULT_OCR_BACKEND)).strip().lower()
+    if backend in ("", "off", "false", "no", "disabled", OCR_OFF):
+        return []
+    tesseract = TesseractEngine(config)
+    novita = NovitaEngine(config)
+    if backend == OCR_TESSERACT:
+        return [tesseract]
+    if backend == OCR_NOVITA:
+        return [novita]
+    # hybrid: Tesseract first, Novita only for pages it could not read.
+    return [tesseract, novita]
+
+
+def ocr_available(config: dict) -> bool:
+    """True when at least one configured engine can actually run right now."""
+    return any(engine.available() for engine in build_ocr_engines(config))
+
+
+def ocr_fingerprint(config: dict, engine_names: list[str] | None = None) -> str:
+    """
+    Identity of the OCR settings a file was processed under.
+
+    Stored in the manifest so a file is re-processed when the settings - or the set
+    of usable engines - change, but not on every run. OCR text is derived, so the
+    file's own content_hash cannot carry this information (see docs/ocr_pass_design.md,
+    section 6).
+    """
+    parts = [
+        str(config.get("ocr_backend", DEFAULT_OCR_BACKEND)),
+        str(config.get("ocr_dpi", DEFAULT_OCR_DPI)),
+        str(config.get("ocr_languages", DEFAULT_OCR_LANGUAGES)),
+        str(config.get("ocr_min_chars_per_page", 50)),
+        str(config.get("ocr_escalate_below_chars", DEFAULT_OCR_ESCALATE_BELOW_CHARS)),
+        # The endpoint and model decide what an escalated page's text looks like, so a
+        # change to either must invalidate cached/assessed text as well.
+        str(config.get("ocr_api_url", DEFAULT_OCR_API_URL)),
+        str(config.get("ocr_api_model", DEFAULT_OCR_API_MODEL)),
+        "+".join(sorted(engine_names or [])),
+    ]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+def render_pdf_page(page, config: dict) -> tuple[object | None, str | None]:
+    """
+    Rasterise one pdfplumber page for OCR. Returns (image, error).
+
+    pdfplumber's own renderer is used so the only new system dependency is the OCR
+    engine itself (no poppler / `pdf2image`).
+    """
+    dpi = config.get("ocr_dpi", DEFAULT_OCR_DPI)
+    try:
+        return page.to_image(resolution=dpi).original, None
+    except Exception as exc:  # missing Pillow/pypdfium2, damaged page, ...
+        return None, f"render failed: {type(exc).__name__}: {exc}"
+
+
+class OcrCache:
+    """
+    Per-source OCR text, keyed by content hash and OCR settings.
+
+    One JSON object per source file. A store whose content_hash or fingerprint no
+    longer matches is discarded rather than partially reused, so neither an edited
+    document nor changed settings can resurrect stale text. Saved after every file,
+    so an interrupted run keeps whatever it already paid for.
+    """
+
+    def __init__(self, root: str | Path | None, identifier: str, content_hash: str,
+                 fingerprint: str) -> None:
+        self.root = Path(root) if root else None
+        self.identifier = identifier
+        self.content_hash = content_hash
+        self.fingerprint = fingerprint
+        self.pages: dict[str, str] = {}
+        self.hits = 0
+        self.dirty = False
+        self._load()
+
+    @property
+    def path(self) -> Path | None:
+        if self.root is None:
+            return None
+        return self.root / f"{hashlib.sha1(self.identifier.encode()).hexdigest()[:20]}.json"
+
+    def _load(self) -> None:
+        path = self.path
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if (data.get("content_hash") == self.content_hash
+                and data.get("fingerprint") == self.fingerprint
+                and isinstance(data.get("pages"), dict)):
+            self.pages = {str(key): str(value) for key, value in data["pages"].items()}
+
+    def get(self, page: int) -> str | None:
+        value = self.pages.get(str(page))
+        if value is not None:
+            self.hits += 1
+        return value
+
+    def set(self, page: int, text: str) -> None:
+        self.pages[str(page)] = text
+        self.dirty = True
+
+    def save(self) -> None:
+        path = self.path
+        if path is None or not self.dirty:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"content_hash": self.content_hash, "fingerprint": self.fingerprint,
+                       "pages": self.pages}
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+            self.dirty = False
+        except OSError:
+            # A cache that cannot be written only costs time on the next run.
+            pass
+
+
+class OcrRunner:
+    """
+    Fill pages that have no usable text layer, one page at a time.
+
+    Only a writing run builds one, so `--dry-run`/`--audit` can never spend money or
+    touch the cache. Engines are ordered primary-then-escalation; the run-wide
+    budget (`--ocr-limit`) and the per-file cap bound one invocation, and anything
+    left over is picked up by the next run (the cache makes the overlap cheap).
+    """
+
+    def __init__(self, config: dict, engines: list[OcrEngine],
+                 total_limit: int | None = None) -> None:
+        self.config = config
+        self.engines = engines
+        self.fingerprint = ocr_fingerprint(config, [engine.name for engine in engines])
+        self.min_chars = config.get("ocr_min_chars_per_page", 50)
+        self.escalate_below = config.get("ocr_escalate_below_chars",
+                                         DEFAULT_OCR_ESCALATE_BELOW_CHARS)
+        self.max_pages_per_file = config.get("ocr_max_pages_per_file",
+                                             DEFAULT_OCR_MAX_PAGES_PER_FILE)
+        self.cache_root = config.get("ocr_cache_path")
+        self.total_limit = total_limit
+        self.pages_ocred = 0       # pages whose text this pass actually recovered
+        self.pages_attempted = 0   # pages sent to an engine (drives --ocr-limit)
+        self.ocr_failures = 0      # pages every engine failed to read
+        self.cache_hits = 0
+        self.engine_calls = 0
+        self.escalations = 0
+        self.api_pages = 0
+        self.render_errors = 0
+        self.deferred = 0          # pages left for a later run (budget/cap)
+        self.pdfs_written = 0
+        self._caches: dict[str, OcrCache] = {}
+
+    @property
+    def primary(self) -> OcrEngine | None:
+        return self.engines[0] if self.engines else None
+
+    @property
+    def escalation(self) -> OcrEngine | None:
+        return self.engines[1] if len(self.engines) > 1 else None
+
+    def available(self) -> bool:
+        return bool(self.engines)
+
+    def needs_ocr(self, text: str) -> bool:
+        return len(text.strip()) < self.min_chars
+
+    def budget_left(self) -> int:
+        """Pages this run may still send to an engine.
+
+        Counts *attempted* pages, not recovered ones: a page that costs a paid API
+        call but comes back empty still spent money, so it has to draw down the
+        budget or `--ocr-limit` would not bound the spend.
+        """
+        if self.total_limit is None:
+            return self.max_pages_per_file
+        return max(0, self.total_limit - self.pages_attempted)
+
+    def cache_for(self, identifier: str, content_hash: str) -> OcrCache:
+        cache = self._caches.get(identifier)
+        if cache is None:
+            cache = OcrCache(self.cache_root, identifier, content_hash, self.fingerprint)
+            self._caches[identifier] = cache
+        return cache
+
+    def flush(self) -> None:
+        for cache in self._caches.values():
+            cache.save()
+
+    def fill(self, rel: str, path: Path, pages: list[dict], entry: dict) -> dict:
+        """
+        OCR the pages of `pages` that have no usable text, in place.
+
+        Returns a small result dict:
+
+        * `attempted` - candidates existed, so the manifest may record the fingerprint
+          once the pass truly finished;
+        * `incomplete` - the budget/cap left pages behind, so the file must stay
+          un-settled and be revisited next run;
+        * `errors` / `fatal` - pages every engine failed to read, and a failure that
+          stopped the whole file (unopenable PDF). Failures are never settled and
+          never cached as "empty";
+        * `ocr_pages` - pages an engine recovered this pass (drives the report);
+        * `recovered` - candidate pages that now have text, including ones answered
+          from the cache, which is what qualifies the file for a searchable PDF.
+        """
+        result = {"pages": pages, "note": None, "ocr_pages": 0,
+                  "recovered": 0, "errors": 0, "fatal": None,
+                  "attempted": False, "incomplete": False}
+        candidates = [page for page in pages
+                      if page.get("page") is not None and self.needs_ocr(page["text"])]
+        if not candidates or self.primary is None:
+            return result
+        result["attempted"] = True
+
+        notes: list[str] = []
+        if len(candidates) > self.max_pages_per_file:
+            dropped = len(candidates) - self.max_pages_per_file
+            candidates = candidates[:self.max_pages_per_file]
+            result["incomplete"] = True
+            self.deferred += dropped
+            notes.append(f"capped at {self.max_pages_per_file} page(s) per run; "
+                         f"{dropped} follow next run")
+
+        identifier = normalize_path(Path(entry.get("root", "")) / rel)
+        cache = self.cache_for(identifier, entry.get("content_hash") or "")
+        by_page = {page["page"]: page for page in candidates}
+
+        # Cache hits cost nothing, so decide what to run before opening the PDF - a
+        # fully cached file never renders a page.
+        allowed = self.budget_left()
+        misses: list[int] = []
+        for number, page in sorted(by_page.items()):
+            cached = cache.get(number)
+            if cached is not None:
+                page["text"] = cached          # recovered by an earlier run
+                self.cache_hits += 1
+            elif len(misses) < allowed:
+                misses.append(number)
+            else:
+                result["incomplete"] = True
+                self.deferred += 1
+
+        if misses:
+            note = self._ocr_pages(path, misses, by_page, cache, result)
+            if note:
+                notes.append(note)
+        cache.save()
+        # Count cache-answered pages too: the file has OCR text now, so it deserves
+        # the same searchable-PDF artefact whether this run or an earlier one read it.
+        result["recovered"] = sum(1 for page in candidates if page["text"].strip())
+        result["note"] = combine_notes(*notes)
+        return result
+
+    def _ocr_pages(self, path: Path, numbers: list[int], by_page: dict[int, dict],
+                   cache: OcrCache, result: dict) -> str | None:
+        rendered, open_note = self._render_pages(path, numbers)
+        if open_note:
+            # Nothing can be OCR'd without the pages, so this is fatal for the file.
+            self.render_errors += len(numbers)
+            result["fatal"] = open_note
+            return open_note
+        notes: list[str] = []
+        empty = 0
+        unrendered = 0
+        failed = 0
+        for number in numbers:
+            image = rendered.get(number)
+            if image is None:
+                unrendered += 1
+                continue
+            self.pages_attempted += 1
+            text, note, page_failed = self._read_page(image, number)
+            if note:
+                notes.append(note)
+            if page_failed:
+                # A failed page is not an empty page. Caching "" here would tell the
+                # next run the page was tried and had nothing to give, so a transient
+                # engine failure (timeout, restart) would become permanent. Leave it
+                # uncached and report it, so the next run retries it.
+                failed += 1
+                continue
+            # The empty string *is* cached on purpose when an engine ran successfully
+            # and read nothing: it records "OCR ran on this page and found nothing",
+            # so a hopeless page is not charged for again.
+            cache.set(number, text or "")
+            if (text or "").strip():
+                by_page[number]["text"] = text
+                result["ocr_pages"] += 1
+                self.pages_ocred += 1
+            else:
+                empty += 1
+        self.render_errors += unrendered
+        result["errors"] += failed
+        self.ocr_failures += failed
+        if empty:
+            notes.append(f"{empty} page(s) still without text after OCR")
+        if failed:
+            notes.append(f"{failed} page(s) failed OCR")
+        if unrendered:
+            notes.append(f"{unrendered} page(s) could not be rendered")
+        return combine_notes(*notes)
+
+    def _render_pages(self, path: Path, numbers: list[int]) -> tuple[dict[int, object], str | None]:
+        """
+        Rasterise the requested pages. Returns (images by page number, fatal note).
+
+        A page that will not render is simply left out; the caller reports the count.
+        Only a failure to open the PDF at all is fatal to the whole file.
+        """
+        if pdfplumber is None:
+            return {}, "pdfplumber not installed: cannot render pages for OCR"
+        rendered: dict[int, object] = {}
+        try:
+            with pdfplumber.open(path) as pdf:
+                total = len(pdf.pages)
+                for number in numbers:
+                    if not 1 <= number <= total:
+                        continue
+                    image, _error = render_pdf_page(pdf.pages[number - 1], self.config)
+                    if image is not None:
+                        rendered[number] = image
+        except Exception as exc:  # encrypted, truncated, unreadable
+            return rendered, f"cannot open for OCR: {type(exc).__name__}: {exc}"
+        return rendered, None
+
+    def _read_page(self, image, number: int) -> tuple[str, str | None, bool]:
+        """
+        Read one page, escalating when the primary engine failed or read too little.
+
+        Returns (text, note, failed). `failed` is True only when no engine produced
+        text because they errored; a page that was read successfully and came back
+        empty is a genuine empty page, not a failure, and an escalation that succeeds
+        (even with empty text) salvages a primary failure.
+        """
+        primary = self.primary
+        if primary is None:
+            return "", None, False
+        text = ""
+        failed_primary = False
+        notes: list[str] = []
+        try:
+            self.engine_calls += 1
+            text = primary.ocr_image(image) or ""
+        except Exception as exc:
+            # An engine failure is not a render failure, so it is reported but not
+            # counted against the renderer.
+            failed_primary = True
+            notes.append(f"page {number}: {primary.name} failed: {type(exc).__name__}: {exc}")
+
+        escalation = self.escalation
+        escalation_succeeded = False
+        if escalation is not None and escalation.available() and (
+                failed_primary or len(text.strip()) < self.escalate_below):
+            try:
+                self.engine_calls += 1
+                self.api_pages += 1
+                self.escalations += 1
+                escalated = escalation.ocr_image(image) or ""
+                escalation_succeeded = True
+            except Exception as exc:
+                notes.append(f"page {number}: {escalation.name} escalation failed: "
+                             f"{type(exc).__name__}: {exc}")
+            else:
+                if len(escalated.strip()) > len(text.strip()):
+                    text = escalated
+        # A primary failure that the escalation could not rescue is the only true
+        # page failure.
+        failed = failed_primary and not escalation_succeeded
+        return text, combine_notes(*notes), failed
+
+
+def searchable_pdf_path(rel: str, config: dict) -> Path | None:
+    root = config.get("ocr_pdf_path")
+    return Path(root) / rel if root else None
+
+
+def ensure_searchable_pdf(rel: str, source: Path, entry: dict, config: dict,
+                          fingerprint: str) -> tuple[bool, str | None]:
+    """
+    Mirror one OCR'd PDF into `ocr_pdf_path` with a searchable text layer.
+
+    `ocrmypdf --skip-text` means only pages without a layer are OCR'd - the pages
+    this pass already targeted - and the corpus itself is never modified. The
+    artefact is best-effort: a missing ocrmypdf/Ghostscript becomes a note rather
+    than a failure, because the cached text already feeds retrieval.
+    """
+    if not config.get("ocr_write_searchable_pdfs", True):
+        return False, None
+    destination = searchable_pdf_path(rel, config)
+    if destination is None:
+        return False, None
+    content_hash = entry.get("content_hash")
+    if (destination.exists() and entry.get("ocr_pdf_hash") == content_hash
+            and entry.get("ocr_pdf_fingerprint") == fingerprint):
+        return False, None            # already current for this content + settings
+    if ocrmypdf is None:
+        # Reported once per run by report_ocr rather than noted against every file,
+        # which would otherwise fill the manifest with identical notes.
+        return False, None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        ocrmypdf.ocr(str(source), str(destination), skip_text=True,
+                     language=str(config.get("ocr_languages", DEFAULT_OCR_LANGUAGES)))
+    except Exception as exc:
+        return False, f"ocrmypdf failed: {type(exc).__name__}: {exc}"
+    entry["ocr_pdf_hash"] = content_hash
+    entry["ocr_pdf_fingerprint"] = fingerprint
+    return True, None
+
+
+# --------------------------------------------------------------------------
 # Classification
 # --------------------------------------------------------------------------
 
-def needs_reprocessing(prev_entry: dict, can_embed: bool, max_retries: int) -> str | None:
-    """Return a reason to re-process a file whose content is unchanged, else None."""
+def needs_reprocessing(prev_entry: dict, can_embed: bool, max_retries: int,
+                       ocr: dict | None = None, rel: str = "") -> str | None:
+    """
+    Return a reason to re-process a file whose content is unchanged, else None.
+
+    `ocr` carries the run's OCR context ({"available": bool, "fingerprint": str}) and
+    defaults to the module-level OCR_AVAILABLE flag, so direct callers and tests keep
+    working without one.
+    """
+    ocr = ocr or {}
+    ocr_available = bool(ocr.get("available", OCR_AVAILABLE))
+    fingerprint = ocr.get("fingerprint") or ocr_fingerprint({})
     status = prev_entry.get("status")
+
     if status == NEEDS_OCR:
-        return "retry: OCR available" if OCR_AVAILABLE else None
+        if not ocr_available:
+            return None
+        if prev_entry.get("ocr_fingerprint") == fingerprint:
+            return None   # already attempted with these engines/settings
+        return "retry: OCR available"
     if status == ERROR and prev_entry.get("attempts", 0) >= max_retries:
         # Repeated failures (corrupt file, permission problem) are parked and
         # surfaced by --strict instead of retried on every run.
         return None
+    # An already-indexed PDF with pages that had no text layer is exactly what the OCR
+    # pass exists for, and its content_hash will never change on its own, so the
+    # fingerprint is what tells "already recovered" from "never attempted".
+    if (ocr_available and rel.lower().endswith(".pdf")
+            and prev_entry.get("pages_without_text")
+            and prev_entry.get("ocr_fingerprint") != fingerprint):
+        return "ocr: pages with no text layer not yet recovered"
     if status in RETRYABLE and can_embed:
         return f"retry: previous run ended in {status}"
     return None
 
 
-def classify(current: dict, previous: dict, config: dict, can_embed: bool) -> list[dict]:
+def classify(current: dict, previous: dict, config: dict, can_embed: bool,
+             ocr: dict | None = None) -> list[dict]:
     track_moves = config.get("track_moves", True)
     track_deletions = config.get("track_deletions", True)
     max_retries = config.get("max_retries", DEFAULT_MAX_RETRIES)
@@ -433,7 +1051,7 @@ def classify(current: dict, previous: dict, config: dict, can_embed: bool) -> li
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev})
             continue
 
-        reason = needs_reprocessing(prev, can_embed, max_retries)
+        reason = needs_reprocessing(prev, can_embed, max_retries, ocr, rel)
         if reason:
             changes.append({"type": MODIFIED, "path": rel, "entry": entry, "previous": prev,
                             "reason": reason})
@@ -774,8 +1392,14 @@ def move_chunks(collection, old_path: str, new_path: str, root: str) -> int:
 
 def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
                             collection, can_embed: bool,
-                            embed_note: str | None = None) -> tuple[str, int, str | None]:
-    """Extract -> chunk -> embed -> upsert one NEW/MODIFIED file."""
+                            embed_note: str | None = None,
+                            ocr: OcrRunner | None = None) -> tuple[str, int, str | None]:
+    """
+    Extract -> OCR pages with no text -> chunk -> embed -> upsert one NEW/MODIFIED file.
+
+    OCR sits between extraction and chunking, on the same page dicts, so recovered
+    text keeps its page number and flows through the unchanged chunking path.
+    """
     rel = change["path"]
     entry = change["entry"]
     path = Path(entry["root"]) / rel
@@ -794,23 +1418,70 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
     if error:
         return ERROR, 0, error
 
-    blank_pages = [page for page in pages if len(page["text"].strip()) < 10]
+    ocr_result = None
+    if ocr is not None and ocr.available() and suffix == ".pdf":
+        ocr_result = ocr.fill(rel, path, pages, entry)
+        settled = (ocr_result["attempted"] and not ocr_result["incomplete"]
+                   and not ocr_result["errors"] and not ocr_result["fatal"])
+        if settled:
+            # OCR text is derived, so the content hash cannot tell a recovered file
+            # from one that was never attempted - the fingerprint is what settles it.
+            # A failed or capped pass stays un-settled and is retried next run.
+            entry["ocr_fingerprint"] = ocr.fingerprint
+        if ocr_result["ocr_pages"]:
+            entry["ocr_pages"] = ocr_result["ocr_pages"]
+    ocr_note = ocr_result["note"] if ocr_result else None
+    # A missing tool must park a file politely; a broken engine or an unopenable PDF
+    # must instead be recorded as an error that is retried and eventually parked.
+    ocr_error = None
+    if ocr_result and ocr_result["fatal"]:
+        ocr_error = ocr_result["fatal"]
+    elif ocr_result and ocr_result["errors"] and not ocr_result["recovered"]:
+        ocr_error = ocr_note or "OCR failed on every candidate page"
+
+    blank_pages = [page for page in pages if len(page["text"].strip()) < BLANK_PAGE_CHARS]
     has_text = sum(len(page["text"].strip()) for page in pages) > 0
 
     if not has_text:
         # An image-only PDF needs OCR; a blank text file is just empty.
         if suffix == ".pdf":
-            return NEEDS_OCR, 0, "no text layer (image-only PDF) - OCR not implemented yet"
+            if ocr_error:
+                return ERROR, 0, ocr_error
+            if ocr is not None and ocr.available():
+                return NEEDS_OCR, 0, combine_notes(
+                    "no text layer (image-only PDF) - OCR recovered no text", ocr_note)
+            return NEEDS_OCR, 0, "no text layer (image-only PDF) - OCR not available"
         return EMPTY, 0, "no extractable text"
 
     if suffix == ".pdf" and not has_text_layer(pages, config):
         minimum = config.get("ocr_min_chars_per_page", 50)
-        return NEEDS_OCR, 0, (f"text layer below {minimum} chars/page - "
-                              "OCR not implemented yet")
+        if ocr_error:
+            return ERROR, 0, ocr_error
+        if ocr_result and ocr_result["ocr_pages"]:
+            # Partial recovery: index what came back instead of dropping the whole
+            # document, and let pages_without_text record the remainder.
+            ocr_note = combine_notes(ocr_note, "low text layer: only partly recovered")
+        elif ocr is not None and ocr.available():
+            return NEEDS_OCR, 0, combine_notes(
+                f"text layer below {minimum} chars/page - OCR recovered no text", ocr_note)
+        else:
+            return NEEDS_OCR, 0, (f"text layer below {minimum} chars/page - "
+                                  "OCR not available")
 
     chunks = build_chunks(pages, config)
+
     if not chunks:
         return EMPTY, 0, "extracted text produced no chunks"
+
+    if ocr is not None and ocr_result and ocr_result["recovered"]:
+        # Only files that actually have OCR text get an artefact - whether this run or
+        # an earlier one read it - so the mirror stays a fraction of the corpus rather
+        # than a full second copy. The entry's hash+fingerprint guard makes it a no-op
+        # when the artefact is already current.
+        written, pdf_note = ensure_searchable_pdf(rel, path, entry, config, ocr.fingerprint)
+        if written:
+            ocr.pdfs_written += 1
+        ocr_note = combine_notes(ocr_note, pdf_note)
 
     entry["page_count"] = len(pages)
     entry["has_text_layer"] = True
@@ -820,17 +1491,17 @@ def process_new_or_modified(change: dict, config: dict, embedder: Embedder,
     if not can_embed or collection is None:
         # Chunks are already built, so the next run with the deps installed only
         # has to embed them - the chunk_count is recorded as computed.
-        return PENDING_EMBEDDING, len(chunks), embed_note or (
-            "sentence-transformers/chromadb not installed")
+        return PENDING_EMBEDDING, len(chunks), combine_notes(
+            embed_note or "sentence-transformers/chromadb not installed", ocr_note)
 
     indexed = index_chunks(collection, embedder, rel, entry["root"], path, chunks,
                            entry["content_hash"])
-    return INDEXED, indexed, None
+    return INDEXED, indexed, ocr_note
 
 
 def apply_one_change(change: dict, config: dict, previous: dict, current: dict, stats: dict,
                      embedder: Embedder, collection, can_embed: bool, verbose: bool,
-                     embed_note: str | None = None) -> None:
+                     embed_note: str | None = None, ocr: OcrRunner | None = None) -> None:
     """Apply a single classified change, updating `current` and `stats` in place."""
     kind = change["type"]
     rel = change["path"]
@@ -882,7 +1553,7 @@ def apply_one_change(change: dict, config: dict, previous: dict, current: dict, 
         return
 
     status, chunk_count, note = process_new_or_modified(
-        {"path": rel, "entry": entry}, config, embedder, collection, can_embed, embed_note)
+        {"path": rel, "entry": entry}, config, embedder, collection, can_embed, embed_note, ocr)
     entry["status"] = status
     entry["last_processed"] = now
     entry["chunk_count"] = chunk_count
@@ -908,7 +1579,8 @@ def apply_one_change(change: dict, config: dict, previous: dict, current: dict, 
 
 def apply_changes(changes: list[dict], config: dict, previous: dict, current: dict,
                   can_embed: bool, verbose: bool, write: bool, extract: bool,
-                  save_cb=None, embed_note: str | None = None) -> dict:
+                  save_cb=None, embed_note: str | None = None,
+                  ocr: OcrRunner | None = None) -> dict:
     """
     Apply every change.
 
@@ -935,7 +1607,7 @@ def apply_changes(changes: list[dict], config: dict, previous: dict, current: di
         # UNCHANGED and MOVED always go through: the log line and the "moved but
         # never indexed" reclassification belong in the report.
         apply_one_change(change, config, previous, current, stats, embedder,
-                         collection, can_embed, verbose, embed_note)
+                         collection, can_embed, verbose, embed_note, ocr)
 
         if not write or change["type"] == UNCHANGED:
             continue
@@ -971,6 +1643,44 @@ def report_not_indexed(current: dict) -> None:
             print(f"  - ... and {len(paths) - 5} more {status}")
 
 
+def report_ocr(runner: OcrRunner | None, config: dict, requested: bool) -> None:
+    """Print what the OCR pass did, or why a requested pass did not run."""
+    if runner is None:
+        if requested:
+            backend = config.get("ocr_backend", DEFAULT_OCR_BACKEND)
+            languages = config.get("ocr_languages", DEFAULT_OCR_LANGUAGES)
+            key_env = config.get("ocr_api_key_env", DEFAULT_OCR_API_KEY_ENV)
+            print(f"OCR: backend '{backend}' is configured but no engine is available "
+                  f"(install Tesseract with '{languages}' and/or set {key_env}); scanned "
+                  "pages stay needs_ocr", file=sys.stderr)
+        return
+    parts = [f"{runner.pages_ocred} page(s) OCR'd"]
+    if runner.cache_hits:
+        parts.append(f"{runner.cache_hits} cache hit(s)")
+    parts.append(f"{runner.engine_calls} engine call(s)")
+    if runner.escalations:
+        parts.append(f"{runner.escalations} escalated")
+    print("OCR: " + ", ".join(parts))
+    if runner.ocr_failures:
+        print(f"OCR: {runner.ocr_failures} page(s) failed and will be retried next run",
+              file=sys.stderr)
+    if runner.api_pages:
+        per_page = config.get("ocr_api_cost_per_page", DEFAULT_OCR_API_COST_PER_PAGE)
+        print(f"OCR API: {runner.api_pages} page(s) via {OCR_NOVITA}, "
+              f"~${runner.api_pages * per_page:.4f} estimated")
+    if runner.pdfs_written:
+        print(f"Searchable PDFs: {runner.pdfs_written} mirrored to "
+              f"{config.get('ocr_pdf_path')}")
+    elif ocrmypdf is None and config.get("ocr_write_searchable_pdfs", True) \
+            and (runner.pages_ocred or runner.cache_hits):
+        print("Searchable PDFs: skipped (ocrmypdf not installed)")
+    if runner.deferred:
+        print(f"OCR deferred: {runner.deferred} page(s) left for a later run "
+              "(--ocr-limit / ocr_max_pages_per_file)")
+    if runner.render_errors:
+        print(f"OCR: {runner.render_errors} page(s) could not be rendered", file=sys.stderr)
+
+
 def report_warnings(scan_stats: dict, current: dict, changes: list[dict]) -> None:
     """Surface the situations that need a human eye, not just a status change."""
     for source in scan_stats.get("unreachable", []):
@@ -1003,8 +1713,8 @@ def report_warnings(scan_stats: dict, current: dict, changes: list[dict]) -> Non
              if entry.get("pages_without_text")]
     if mixed:
         pages = sum(entry["pages_without_text"] for _, entry in mixed)
-        print(f"Note: {len(mixed)} indexed file(s) have {pages} page(s) with no text "
-              "(OCR candidates once the OCR stage lands)")
+        print(f"Note: {len(mixed)} indexed file(s) still have {pages} page(s) with no "
+              "text layer (OCR candidates; run without --no-ocr to recover them)")
     for hint in rename_hints(changes):
         print(f"Note: {hint}")
 
@@ -1052,6 +1762,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="re-hash every file instead of trusting size+mtime")
     parser.add_argument("--strict", action="store_true",
                         help="exit non-zero if any file is left pending (for cron)")
+    parser.add_argument("--no-ocr", action="store_true",
+                        help="skip the OCR pass even when an engine is available")
+    parser.add_argument("--ocr-limit", type=int, default=None, metavar="PAGES",
+                        help="OCR at most PAGES page(s) this run; the rest follow next run")
     parser.add_argument("-v", "--verbose", action="store_true", help="log every file")
     return parser.parse_args(argv)
 
@@ -1080,7 +1794,29 @@ def main(argv: list[str] | None = None) -> int:
     extract = write or args.audit
     can_embed = write and Embedder.available() and chromadb is not None
 
-    changes = classify(current, previous, config, can_embed)
+    # OCR only ever runs on a writing run: --dry-run and --audit must be free, so
+    # they never build engines, never render a page and never touch the cache.
+    ocr_backend = str(config.get("ocr_backend", DEFAULT_OCR_BACKEND)).strip().lower()
+    disabled_backends = ("", "off", "false", "no", "disabled", OCR_OFF)
+    if ocr_backend not in disabled_backends + (OCR_TESSERACT, OCR_NOVITA, OCR_HYBRID):
+        # A typo must not silently pick a backend - especially not the one that spends.
+        print(f"Warning: unknown ocr_backend '{ocr_backend}'; using "
+              f"'{DEFAULT_OCR_BACKEND}'", file=sys.stderr)
+        ocr_backend = DEFAULT_OCR_BACKEND
+        config["ocr_backend"] = DEFAULT_OCR_BACKEND
+    ocr_requested = write and not args.no_ocr and ocr_backend not in disabled_backends
+    ocr_runner = None
+    if ocr_requested:
+        engines = [engine for engine in build_ocr_engines(config) if engine.available()]
+        if engines:
+            ocr_runner = OcrRunner(config, engines, total_limit=args.ocr_limit)
+    ocr_ctx = {
+        "available": ocr_runner is not None,
+        "fingerprint": ocr_fingerprint(
+            config, [engine.name for engine in (ocr_runner.engines if ocr_runner else [])]),
+    }
+
+    changes = classify(current, previous, config, can_embed, ocr_ctx)
 
     def save_now() -> None:
         save_manifest(manifest_path, current, {"scanned": scan_stats["scanned"],
@@ -1089,7 +1825,12 @@ def main(argv: list[str] | None = None) -> int:
     stats = apply_changes(changes, config, previous, current, can_embed,
                           args.verbose, write=write, extract=extract,
                           save_cb=save_now if write else None,
-                          embed_note="--audit: extraction only, not indexed" if args.audit else None)
+                          embed_note="--audit: extraction only, not indexed" if args.audit else None,
+                          ocr=ocr_runner)
+
+    if ocr_runner is not None:
+        # Persist whatever was paid for, even if the run is interrupted later.
+        ocr_runner.flush()
 
     if write:
         # Final save; apply_changes also saved every batch_size changes.
@@ -1109,6 +1850,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.audit:
         print("Mode: audit (--audit) - extracted, chunked, nothing written")
     report_warnings(scan_stats, current, changes)
+    report_ocr(ocr_runner, config, requested=ocr_requested)
 
     if write:
         print(f"Indexed: {stats.get('chunks_indexed', 0)} chunks"
@@ -1126,7 +1868,8 @@ def main(argv: list[str] | None = None) -> int:
               f"from {pages} page(s)")
         if no_text:
             print(f"Pages with no text layer: {no_text} "
-                  f"({no_text / max(pages, 1):.0%} of extracted pages)")
+                  f"({no_text / max(pages, 1):.0%} of extracted pages) - OCR candidates; "
+                  "audit mode never OCRs, run the script without --audit to fill them")
         report_not_indexed(current)
         print("Audit: nothing written")
     else:

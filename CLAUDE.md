@@ -38,7 +38,7 @@ rule_books/
 │   ├── deduplication_ignore_list.json       # Committed: files to skip during ingestion
 │   ├── deduplication_progress.json          # Gitignored: dedup resume state
 │   ├── incremental_update_strategy.md       # Manifest-based incremental pipeline design
-│   └── ocr_pass_design.md                    # Design for the deferred OCR pass (not implemented)
+│   └── ocr_pass_design.md                    # OCR pass design, decision log + implementation notes
 └── scripts/
     ├── scan_extensions.py
     ├── create_deduplication_ignore_list_v2.py
@@ -57,7 +57,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → chunk → embed → ChromaDB upsert |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
-| `docs/ocr_pass_design.md` | Design for the OCR pass over pages with no text layer (deferred task, not implemented) |
+| `docs/ocr_pass_design.md` | OCR pass design, decision log and implementation notes; runs inside `scripts/incremental_ingest.py` |
 | `docs/kerc_folder_inventory.md` | Corpus scan: 994 PDFs, 25K pages, category breakdown, cost projections |
 | `docs/deduplication_report.md` | 55 duplicate groups detailed |
 | `docs/deduplication_ignore_list.json` | 55 file paths to skip during ingestion |
@@ -86,8 +86,13 @@ python scripts/incremental_ingest.py --dry-run -v
 # unsupported counts) without embedding or writing anything
 python scripts/incremental_ingest.py --audit
 
-# Incremental ingest: apply them
+# Incremental ingest: apply them (runs the OCR pass when an engine is available)
 python scripts/incremental_ingest.py
+
+# OCR pass controls: --no-ocr skips it, --ocr-limit N caps pages this run
+# (--dry-run/--audit never OCR, so they cannot spend anything)
+python scripts/incremental_ingest.py --no-ocr
+python scripts/incremental_ingest.py --ocr-limit 200
 
 # Tests (no ChromaDB, no model download needed)
 python -m pytest
@@ -95,7 +100,7 @@ python -m pytest
 
 `create_deduplication_ignore_list_v2.py` imports `pdfplumber` and `python-docx` optionally: PDFs are skipped if pdfplumber is missing. It is resumable via `docs/deduplication_progress.json` and processes `batch_size` files per batch.
 
-`incremental_ingest.py` also accepts `--full-hash` (re-hash everything instead of trusting size+mtime), `--strict` (exit 2 when files are left blocked, for cron), and `--source`/`--manifest`/`--chroma-path` overrides for testing against a scratch corpus.
+`incremental_ingest.py` also accepts `--full-hash` (re-hash everything instead of trusting size+mtime), `--strict` (exit 2 when files are left blocked, for cron), `--no-ocr`/`--ocr-limit N` (OCR controls), and `--source`/`--manifest`/`--chroma-path` overrides for testing against a scratch corpus.
 
 Three read-only-ish modes, from cheapest to most thorough:
 
@@ -103,7 +108,7 @@ Three read-only-ish modes, from cheapest to most thorough:
 |------|-------|--------|-----------|
 | `--dry-run` | hashes changed files | nothing | see which files are NEW/MODIFIED/MOVED/DELETED |
 | `--audit` | + extracts and chunks | nothing | size the OCR/unsupported workload before a full run |
-| default | + embeds | manifest + ChromaDB | actually ingest |
+| default | + OCR + embeds | manifest + ChromaDB | actually ingest (the only mode that OCRs) |
 
 ## Tests
 
@@ -172,8 +177,9 @@ dedup signature, page count, chunk count and status per file. Per change type:
 
 - Statuses: `indexed`, `needs_ocr`, `pending_embedding`, `unsupported`, `empty`, `error`.
   Anything left in a retryable status is picked up automatically on a later run once the
-  missing capability exists (flip `OCR_AVAILABLE` in the script when OCR lands). Files that keep
-  failing (unreadable, corrupt) are parked after `max_retries` attempts and only surface via `--strict`.
+  missing capability exists (install Tesseract/the Kannada pack or export the API key, and the
+  OCR pass is enabled the next run). Files that keep failing (unreadable, corrupt) are parked
+  after `max_retries` attempts and only surface via `--strict`.
 - Edge cases handled explicitly, because each one looks like a mass change if ignored:
   - **unreachable source** (unmounted drive, renamed folder) → its previous entries are kept as-is,
     never treated as DELETED, so a missing `D:` cannot wipe the collection
@@ -195,7 +201,23 @@ dedup signature, page count, chunk count and status per file. Per change type:
   `chunk_count` instead of every id, and chunks are still pruned/updated by metadata filters.
 - Chunks never span pages, so citations keep an exact page number; `.txt`/`.md`/`.docx` and
   spreadsheets have no pages and record `page = -1`. Partially scanned files keep a
-  `pages_without_text` count for the future OCR pass.
+  `pages_without_text` count, which the OCR pass drives down.
+- **OCR pass** (`docs/ocr_pass_design.md`): runs between extraction and chunking, page-level, only
+  for pages below `ocr_min_chars_per_page`. `ocr_backend` selects `tesseract` | `novita` | `hybrid`
+  | `none`; `hybrid` is Tesseract first with a Novita escalation on pages it read too little from.
+  - A page is OCR'd only if no engine can read it as text — never a full-corpus re-run. Recovered
+    text keeps its page number, so chunking/citations are unchanged.
+  - Recovery is cached (`ocr_cache_path`, keyed by `content_hash` + settings + usable engines), so a
+    re-run is free and an interrupted run resumes. `ocr_fingerprint` in the manifest re-processes
+    an already-indexed PDF whose `content_hash` cannot change but whose blank pages were never fixed.
+  - A missing engine parks files as `needs_ocr` (no attempts burned); an engine error is `error` and
+    is retried, then parked after `max_retries`. Nothing is ever cached as "empty" on an engine error,
+    so a transient failure is retried rather than becoming permanent.
+  - `--ocr-limit N` caps the pages sent to an engine in one run (attempted pages count, including
+    reads that come back empty); the remainder is deferred to the next run.
+  - `ocrmypdf --skip-text` mirrors only the files that actually have OCR text into `ocr_pdf_path`
+    (best-effort; a missing Ghostscript is a note, not a failure).
+  - `--dry-run`/`--audit`/`--no-ocr` never build an engine, so they cannot spend money.
 - Extraction coverage: `.pdf` (pdfplumber), `.docx` (python-docx), `.txt`/`.md`, spreadsheets
   (`.xlsx`/`.xlsm` via openpyxl, `.xls` via xlrd, `.csv` via stdlib). A missing library or an
   unimplemented format yields `unsupported` with the reason, never a crash — `.doc` and `.rtf` are
@@ -236,5 +258,5 @@ dedup signature, page count, chunk count and status per file. Per change type:
 |-----------|---------|
 | RAG query CLI with citation support | v1.0.0 |
 | Gradio UI with citations | v1.1.0 |
-| OCR pipeline integration (Tesseract + Novita.ai hybrid) | — |
+| OCR pipeline integration (Tesseract + Novita.ai hybrid) | implemented, awaiting the real-corpus run |
 | Scheduled auto-ingest via cron | v1.2.0 |

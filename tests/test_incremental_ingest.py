@@ -107,9 +107,28 @@ def write_config(tmp_path: Path, corpus: Path, **overrides) -> Path:
         "collection_name": "test_collection",
         "ocr_min_chars_per_page": 50,
         "max_retries": 3,
+        # OCR off by default so the suite is deterministic on a machine that happens
+        # to have Tesseract/key present; OCR tests opt in explicitly.
+        "ocr_backend": "none",
+        "ocr_dpi": 300,
+        "ocr_languages": "eng+kan",
+        "ocr_escalate_below_chars": 200,
+        "ocr_max_pages_per_file": 500,
+        "ocr_cache_path": str(tmp_path / "ocr_cache"),
+        "ocr_pdf_path": str(tmp_path / "ocr_pdfs"),
+        "ocr_write_searchable_pdfs": True,
+        "ocr_api_cost_per_page": 0.0001,
     }
     config.update(overrides)
     path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return path
+
+
+def update_config(path: Path, **overrides) -> Path:
+    """Rewrite a test config in place, e.g. to turn the OCR pass on for a rerun."""
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    config.update(overrides)
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     return path
 
@@ -592,6 +611,560 @@ def test_is_lock_file_ignores_normal_names():
 
 
 # --------------------------------------------------------------------------
+# OCR pass
+# --------------------------------------------------------------------------
+
+class FakeOcrEngine:
+    """Stand-in engine: returns canned text and counts calls."""
+
+    def __init__(self, name="tesseract", text="OCR text. " * 20, available=True, fail=False):
+        self.name = name
+        self.text = text
+        self.calls = 0
+        self._available = available
+        self.fail = fail
+
+    def available(self):
+        return self._available
+
+    def ocr_image(self, image):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("engine exploded")
+        return self.text
+
+
+def ocr_config(tmp_path: Path, **overrides) -> dict:
+    config = {
+        "ocr_backend": "hybrid",
+        "ocr_dpi": 300,
+        "ocr_languages": "eng+kan",
+        "ocr_min_chars_per_page": 50,
+        "ocr_escalate_below_chars": 200,
+        "ocr_max_pages_per_file": 500,
+        "ocr_cache_path": str(tmp_path / "ocr_cache"),
+        "ocr_pdf_path": str(tmp_path / "ocr_pdfs"),
+        "ocr_write_searchable_pdfs": True,
+        "ocr_api_cost_per_page": 0.0001,
+    }
+    config.update(overrides)
+    return config
+
+
+def make_runner(tmp_path: Path, engines, total_limit=None, **overrides) -> "ingest.OcrRunner":
+    return ingest.OcrRunner(ocr_config(tmp_path, **overrides), engines, total_limit=total_limit)
+
+
+def fake_pdf(monkeypatch, page_count: int = 1) -> None:
+    """Replace pdfplumber's opener and the renderer so OCR needs neither on disk."""
+    class FakePdf:
+        def __init__(self):
+            self.pages = [object() for _ in range(page_count)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(ingest, "pdfplumber",
+                        types.SimpleNamespace(open=lambda path: FakePdf()))
+    monkeypatch.setattr(ingest, "render_pdf_page", lambda page, config: ("image", None))
+
+
+def test_build_ocr_engines_by_backend():
+    def names(backend):
+        return [engine.name for engine in ingest.build_ocr_engines({"ocr_backend": backend})]
+
+    assert names("none") == []
+    assert names("off") == []
+    assert names("disabled") == []
+    assert names("tesseract") == ["tesseract"]
+    assert names("novita") == ["novita"]
+    assert names("hybrid") == ["tesseract", "novita"]
+
+
+def test_tesseract_engine_requires_every_configured_language(monkeypatch):
+    monkeypatch.setattr(ingest, "pytesseract", types.SimpleNamespace(
+        get_languages=lambda config="": ["eng"],
+        image_to_string=lambda image, lang: "text"))
+
+    assert ingest.TesseractEngine({"ocr_languages": "eng"}).available() is True
+    strict = ingest.TesseractEngine({"ocr_languages": "eng+kan"})
+    assert strict.available() is False
+    assert strict.missing_languages() == ["kan"]
+
+    monkeypatch.setattr(ingest, "pytesseract", None)
+    assert ingest.TesseractEngine({"ocr_languages": "eng"}).available() is False
+
+
+def test_tesseract_engine_is_unavailable_without_the_binary(monkeypatch):
+    def no_binary(config=""):
+        raise RuntimeError("tesseract is not installed or it's not in your PATH")
+
+    monkeypatch.setattr(ingest, "pytesseract", types.SimpleNamespace(get_languages=no_binary))
+
+    assert ingest.TesseractEngine({"ocr_languages": "eng"}).available() is False
+
+
+def test_novita_engine_needs_an_api_key(monkeypatch):
+    monkeypatch.delenv("NOVITA_API_KEY", raising=False)
+    assert ingest.NovitaEngine({}).available() is False
+
+    monkeypatch.setenv("NOVITA_API_KEY", "secret")
+    assert ingest.NovitaEngine({}).available() is True
+    assert ingest.NovitaEngine({"ocr_api_key_env": "OTHER_KEY"}).available() is False
+
+
+def test_novita_engine_posts_the_page_and_reads_the_reply(monkeypatch):
+    monkeypatch.setenv("NOVITA_API_KEY", "secret")
+    captured: dict = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "Recovered"}}]}).encode()
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["headers"] = request.headers
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(ingest.urllib.request, "urlopen", fake_urlopen)
+
+    class FakeImage:
+        def save(self, buffer, format=None):
+            buffer.write(b"png-bytes")
+
+    text = ingest.NovitaEngine({"ocr_api_timeout": 5}).ocr_image(FakeImage())
+
+    assert text == "Recovered"
+    assert captured["url"] == ingest.DEFAULT_OCR_API_URL
+    assert captured["timeout"] == 5
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert captured["body"]["model"] == ingest.DEFAULT_OCR_API_MODEL
+    content = captured["body"]["messages"][0]["content"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_extract_api_text_handles_response_shapes():
+    assert ingest.extract_api_text({"choices": [{"message": {"content": "hi"}}]}) == "hi"
+    assert ingest.extract_api_text({"choices": [{"message": {"content": [
+        {"text": "a"}, {"text": "b"}]}}]}) == "ab"
+    assert ingest.extract_api_text({}) == ""
+    assert ingest.extract_api_text({"choices": []}) == ""
+    assert ingest.extract_api_text("not a dict") == ""
+
+
+def test_ocr_fingerprint_tracks_settings_and_engines():
+    base = ingest.ocr_fingerprint({"ocr_backend": "hybrid"}, ["tesseract"])
+
+    assert base == ingest.ocr_fingerprint({"ocr_backend": "hybrid"}, ["tesseract"])
+    # A newly usable engine means the file deserves another attempt.
+    assert base != ingest.ocr_fingerprint({"ocr_backend": "hybrid"}, ["tesseract", "novita"])
+    assert base != ingest.ocr_fingerprint({"ocr_backend": "tesseract"}, ["tesseract"])
+    assert base != ingest.ocr_fingerprint({"ocr_backend": "hybrid", "ocr_dpi": 400},
+                                           ["tesseract"])
+    # A different endpoint/model produces different text, so cached text must not be
+    # reused after either changes.
+    assert base != ingest.ocr_fingerprint({"ocr_backend": "hybrid",
+                                           "ocr_api_model": "other/model"}, ["tesseract"])
+
+
+def test_render_pdf_page_uses_the_config_dpi(monkeypatch):
+    calls: dict = {}
+
+    class Page:
+        def to_image(self, resolution):
+            calls["resolution"] = resolution
+            return types.SimpleNamespace(original="image")
+
+    image, error = ingest.render_pdf_page(Page(), {"ocr_dpi": 150})
+    assert (image, error) == ("image", None)
+    assert calls["resolution"] == 150
+
+    class Broken:
+        def to_image(self, resolution):
+            raise RuntimeError("pypdfium2 missing")
+
+    image, error = ingest.render_pdf_page(Broken(), {})
+    assert image is None
+    assert "render failed" in error
+
+
+def test_ocr_fill_only_touches_pages_without_text(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch, page_count=2)
+    engine = FakeOcrEngine(text="Recovered text " * 10)
+    runner = make_runner(tmp_path, [engine])
+    pages = [{"page": 1, "text": "Rule 1.1 Fees\n" + "text " * 60},
+             {"page": 2, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert pages[0]["text"].startswith("Rule 1.1"), "a page with text must be left alone"
+    assert pages[1]["text"] == "Recovered text " * 10
+    assert result == {**result, "ocr_pages": 1, "attempted": True,
+                      "incomplete": False, "note": None}
+    assert engine.calls == 1
+
+
+def test_ocr_fill_does_nothing_without_candidates(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine()
+    runner = make_runner(tmp_path, [engine])
+    pages = [{"page": 1, "text": "plenty of text " * 20}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["attempted"] is False
+    assert engine.calls == 0
+
+
+def test_ocr_cache_avoids_rerunning_the_engine(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="Cached text " * 20)
+    runner = make_runner(tmp_path, [engine])
+    entry = {"root": str(tmp_path), "content_hash": "h1"}
+    runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}], entry)
+    runner.flush()
+    assert engine.calls == 1
+
+    again = FakeOcrEngine()
+    second = make_runner(tmp_path, [again])
+    pages = [{"page": 1, "text": ""}]
+    result = second.fill("a.pdf", tmp_path / "a.pdf", pages, entry)
+
+    assert pages[0]["text"] == "Cached text " * 20
+    assert again.calls == 0
+    assert second.cache_hits == 1
+    assert result["ocr_pages"] == 0
+
+
+def test_ocr_cache_is_discarded_when_the_content_changes(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="Cached text " * 20)
+    runner = make_runner(tmp_path, [engine])
+    runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}],
+                {"root": str(tmp_path), "content_hash": "h1"})
+    runner.flush()
+
+    second_engine = FakeOcrEngine(text="Fresh text " * 20)
+    second = make_runner(tmp_path, [second_engine])
+    pages = [{"page": 1, "text": ""}]
+    second.fill("a.pdf", tmp_path / "a.pdf", pages, {"root": str(tmp_path),
+                                                     "content_hash": "h2"})
+
+    assert second_engine.calls == 1
+    assert pages[0]["text"] == "Fresh text " * 20
+
+
+def test_ocr_cache_is_discarded_when_the_settings_change(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    entry = {"root": str(tmp_path), "content_hash": "h1"}
+    runner = make_runner(tmp_path, [FakeOcrEngine()])
+    runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}], entry)
+    runner.flush()
+
+    # Different languages (part of the fingerprint) must not reuse the old text.
+    engine = FakeOcrEngine()
+    second = make_runner(tmp_path, [engine], ocr_languages="eng")
+    second.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}], entry)
+
+    assert engine.calls == 1
+
+
+def test_ocr_limit_defers_the_remaining_pages(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch, page_count=3)
+    engine = FakeOcrEngine()
+    runner = make_runner(tmp_path, [engine], total_limit=1)
+    pages = [{"page": number, "text": ""} for number in (1, 2, 3)]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["ocr_pages"] == 1
+    assert result["incomplete"] is True
+    assert engine.calls == 1
+    assert runner.deferred == 2
+
+
+def test_ocr_per_file_cap_is_reported_and_not_settled(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch, page_count=4)
+    engine = FakeOcrEngine()
+    runner = make_runner(tmp_path, [engine], ocr_max_pages_per_file=2)
+    pages = [{"page": number, "text": ""} for number in range(1, 5)]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["ocr_pages"] == 2
+    assert result["incomplete"] is True
+    assert "capped at 2 page(s)" in result["note"]
+
+
+def test_ocr_reports_pages_it_could_not_render(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    monkeypatch.setattr(ingest, "render_pdf_page", lambda page, config: (None, "render failed"))
+    engine = FakeOcrEngine()
+    runner = make_runner(tmp_path, [engine])
+    pages = [{"page": 1, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["ocr_pages"] == 0
+    assert "could not be rendered" in result["note"]
+    assert engine.calls == 0
+    assert runner.render_errors == 1
+
+
+def test_ocr_survives_a_pdf_that_cannot_be_opened(tmp_path, monkeypatch):
+    def boom(path):
+        raise RuntimeError("encrypted")
+
+    monkeypatch.setattr(ingest, "pdfplumber", types.SimpleNamespace(open=boom))
+    runner = make_runner(tmp_path, [FakeOcrEngine()])
+    pages = [{"page": 1, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["ocr_pages"] == 0
+    assert "cannot open for OCR" in result["note"]
+    assert result["fatal"] and "cannot open" in result["fatal"]
+    assert pages[0]["text"] == ""
+
+
+def test_ocr_reports_an_engine_failure_without_crashing(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    runner = make_runner(tmp_path, [FakeOcrEngine(fail=True)])
+    pages = [{"page": 1, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert result["ocr_pages"] == 0
+    assert "tesseract failed" in result["note"]
+    assert result["errors"] == 1
+    assert result["recovered"] == 0
+    assert runner.ocr_failures == 1
+
+
+def test_ocr_engine_failure_is_not_cached_as_an_empty_page(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    entry = {"root": str(tmp_path), "content_hash": "h1"}
+    runner = make_runner(tmp_path, [FakeOcrEngine(fail=True)])
+
+    runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}], entry)
+    runner.flush()
+
+    # A page the engine failed to read must not be remembered as "read, and empty",
+    # or a transient failure (timeout, restart) would become permanent.
+    second_engine = FakeOcrEngine(text="Recovered. " * 20)
+    second = make_runner(tmp_path, [second_engine])
+    pages = [{"page": 1, "text": ""}]
+    result = second.fill("a.pdf", tmp_path / "a.pdf", pages, entry)
+
+    assert second_engine.calls == 1
+    assert pages[0]["text"] == "Recovered. " * 20
+    assert result["recovered"] == 1
+
+
+def test_hybrid_escalation_salvages_a_failed_primary_engine(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    primary = FakeOcrEngine(name="tesseract", fail=True)
+    better = FakeOcrEngine(name="novita", text="Recovered by the API. " * 20)
+    runner = make_runner(tmp_path, [primary, better])
+    pages = [{"page": 1, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert primary.calls == 1
+    assert better.calls == 1
+    assert result["errors"] == 0, "a rescued page is not a failure"
+    assert result["recovered"] == 1
+    assert pages[0]["text"] == "Recovered by the API. " * 20
+    assert runner.api_pages == 1
+
+
+def test_ocr_limit_counts_pages_that_read_empty(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="")          # a successful read that found nothing
+    runner = make_runner(tmp_path, [engine], total_limit=1)
+    entry = {"root": str(tmp_path), "content_hash": "h1"}
+
+    first = runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}], entry)
+    second = runner.fill("b.pdf", tmp_path / "b.pdf", [{"page": 1, "text": ""}], entry)
+
+    # An empty read still spent the run's budget; without counting it, the cap would
+    # not bound the page count that was actually sent to a paid engine.
+    assert engine.calls == 1
+    assert runner.pages_attempted == 1
+    assert first["errors"] == 0 and second["recovered"] == 0
+    assert second["incomplete"] is True
+
+
+def test_hybrid_escalates_pages_the_first_engine_could_not_read(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    primary = FakeOcrEngine(name="tesseract", text="tiny")
+    better = FakeOcrEngine(name="novita", text="Recovered properly " * 20)
+    runner = make_runner(tmp_path, [primary, better])
+    pages = [{"page": 1, "text": ""}]
+
+    runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert pages[0]["text"] == "Recovered properly " * 20
+    assert primary.calls == 1
+    assert better.calls == 1
+    assert runner.escalations == 1
+    assert runner.api_pages == 1
+
+
+def test_hybrid_does_not_escalate_pages_the_first_engine_read(tmp_path, monkeypatch):
+    fake_pdf(monkeypatch)
+    primary = FakeOcrEngine(name="tesseract", text="long enough text " * 20)
+    better = FakeOcrEngine(name="novita")
+    runner = make_runner(tmp_path, [primary, better])
+
+    runner.fill("a.pdf", tmp_path / "a.pdf", [{"page": 1, "text": ""}],
+                {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert better.calls == 0
+    assert runner.api_pages == 0
+
+
+def test_ocr_fill_is_a_noop_without_engines(tmp_path):
+    runner = make_runner(tmp_path, [])
+    pages = [{"page": 1, "text": ""}]
+
+    result = runner.fill("a.pdf", tmp_path / "a.pdf", pages,
+                         {"root": str(tmp_path), "content_hash": "h1"})
+
+    assert runner.available() is False
+    assert result["attempted"] is False
+    assert pages[0]["text"] == ""
+
+
+def test_searchable_pdf_is_written_once_per_content_and_settings(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_ocr(source, destination, **kwargs):
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        Path(destination).write_bytes(b"%PDF-1.4 fake")
+        calls.append((source, destination, kwargs))
+
+    monkeypatch.setattr(ingest, "ocrmypdf", types.SimpleNamespace(ocr=fake_ocr))
+    config = ocr_config(tmp_path)
+    entry = {"content_hash": "h1"}
+    source = tmp_path / "source.pdf"
+
+    written, note = ingest.ensure_searchable_pdf("a.pdf", source, entry, config, "fp1")
+
+    assert (written, note) == (True, None)
+    assert calls[0][2]["skip_text"] is True, "only pages without a layer may be OCR'd"
+    assert calls[0][2]["language"] == "eng+kan"
+    assert (tmp_path / "ocr_pdfs" / "a.pdf").exists()
+
+    again, _ = ingest.ensure_searchable_pdf("a.pdf", source, entry, config, "fp1")
+    assert again is False
+    assert len(calls) == 1
+
+    entry["content_hash"] = "h2"
+    third, _ = ingest.ensure_searchable_pdf("a.pdf", source, entry, config, "fp1")
+    assert third is True
+    assert len(calls) == 2
+
+
+def test_searchable_pdf_is_skipped_without_ocrmypdf(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest, "ocrmypdf", None)
+
+    written, note = ingest.ensure_searchable_pdf("a.pdf", tmp_path / "s.pdf", {},
+                                                 ocr_config(tmp_path), "fp")
+
+    # Silently skipped here; report_ocr says so once for the whole run instead of
+    # writing the same note against every OCR'd file.
+    assert (written, note) == (False, None)
+
+
+def test_searchable_pdf_can_be_turned_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest, "ocrmypdf", None)
+
+    written, note = ingest.ensure_searchable_pdf(
+        "a.pdf", tmp_path / "s.pdf", {}, ocr_config(tmp_path, ocr_write_searchable_pdfs=False),
+        "fp")
+
+    assert (written, note) == (False, None)
+
+
+def test_classify_leaves_ocr_files_alone_while_no_engine_is_available():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3}
+    previous = entries(("scan.pdf", "h1", {"status": ingest.NEEDS_OCR}))
+
+    changes = ingest.classify(entries(("scan.pdf", "h1", {"status": ingest.NEEDS_OCR})),
+                              previous, config, True,
+                              {"available": False, "fingerprint": "fp"})
+
+    assert changes[0]["type"] == ingest.UNCHANGED
+
+
+def test_classify_retries_needs_ocr_until_the_fingerprint_is_recorded():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3}
+    ocr = {"available": True, "fingerprint": "fp"}
+    previous = entries(("scan.pdf", "h1", {"status": ingest.NEEDS_OCR}))
+
+    changes = ingest.classify(entries(("scan.pdf", "h1", {"status": ingest.NEEDS_OCR})),
+                              previous, config, True, ocr)
+    assert changes[0]["type"] == ingest.MODIFIED
+    assert changes[0]["reason"] == "retry: OCR available"
+
+    attempted = entries(("scan.pdf", "h1", {"status": ingest.NEEDS_OCR,
+                                              "ocr_fingerprint": "fp"}))
+    changes = ingest.classify(attempted, attempted, config, True, ocr)
+    assert changes[0]["type"] == ingest.UNCHANGED, "a hopeless file must stop costing money"
+
+
+def test_classify_reprocesses_an_indexed_pdf_with_blank_pages():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3}
+    ocr = {"available": True, "fingerprint": "fp"}
+    previous = entries(("mixed.pdf", "h1", {"status": ingest.INDEXED, "pages_without_text": 3}))
+
+    changes = ingest.classify(
+        entries(("mixed.pdf", "h1", {"status": ingest.INDEXED, "pages_without_text": 3})),
+        previous, config, True, ocr)
+
+    assert changes[0]["type"] == ingest.MODIFIED
+    assert "no text layer" in changes[0]["reason"]
+
+    settled = entries(("mixed.pdf", "h1", {"status": ingest.INDEXED, "pages_without_text": 0,
+                                             "ocr_fingerprint": "fp"}))
+    changes = ingest.classify(settled, settled, config, True, ocr)
+    assert changes[0]["type"] == ingest.UNCHANGED
+
+
+def test_classify_ignores_blank_pages_in_non_pdf_files():
+    config = {"track_moves": True, "track_deletions": True, "max_retries": 3}
+    ocr = {"available": True, "fingerprint": "fp"}
+    previous = entries(("note.txt", "h1", {"status": ingest.INDEXED, "pages_without_text": 1}))
+
+    changes = ingest.classify(
+        entries(("note.txt", "h1", {"status": ingest.INDEXED, "pages_without_text": 1})),
+        previous, config, True, ocr)
+
+    assert changes[0]["type"] == ingest.UNCHANGED, "only PDFs are OCR candidates"
+
+
+# --------------------------------------------------------------------------
 # End-to-end runs
 # --------------------------------------------------------------------------
 
@@ -960,3 +1533,238 @@ def test_manifest_records_hash_status_and_page_metadata(tmp_path, store):
     assert entry["attempts"] == 0
     assert entry["last_processed"].endswith("+00:00")
     assert entry["root"] == str(corpus)
+
+
+# --------------------------------------------------------------------------
+# End-to-end OCR runs
+# --------------------------------------------------------------------------
+
+def test_ocr_pass_indexes_an_image_only_pdf(tmp_path, store, capsys, monkeypatch):
+    collection, _ = store
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages",
+                        lambda path, config: ([{"page": 1, "text": ""}], None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="Rule 9.1 Recovered. " * 20)
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    assert run(config) == 0
+
+    entry = scrap(config, "scan.pdf")
+    assert entry["status"] == ingest.INDEXED
+    assert entry["pages_without_text"] == 0
+    assert entry["ocr_pages"] == 1
+    assert entry["ocr_fingerprint"]
+    assert collection.count() > 0
+    out = capsys.readouterr().out
+    assert "OCR: 1 page(s) OCR'd" in out
+    assert "Searchable PDFs: skipped (ocrmypdf not installed)" in out
+    assert engine.calls == 1
+
+
+def test_ocr_recovers_blank_pages_in_an_already_indexed_pdf(tmp_path, store, monkeypatch):
+    """The trap the design exists for: the content hash cannot change, so only the
+    OCR fingerprint can make an already-indexed PDF with blank pages get re-processed."""
+    collection, counters = store
+    corpus = write_corpus(tmp_path / "corpus", {"mixed.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="none")
+    monkeypatch.setattr(ingest, "extract_pages", lambda path, config: (
+        [{"page": 1, "text": "Rule 1.1 Fees\n" + "text " * 60}, {"page": 2, "text": ""}], None))
+
+    run(config)                       # first pass: no OCR, page 2 has no text
+    assert scrap(config, "mixed.pdf")["pages_without_text"] == 1
+    assert "ocr_fingerprint" not in scrap(config, "mixed.pdf")
+    embedded = counters["embedded"]
+
+    update_config(config, ocr_backend="hybrid")
+    fake_pdf(monkeypatch, page_count=2)
+    engine = FakeOcrEngine(text="Recovered page two. " * 20)
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    run(config)                       # content unchanged, so this is the fingerprint at work
+
+    entry = scrap(config, "mixed.pdf")
+    assert entry["pages_without_text"] == 0
+    assert entry["ocr_pages"] == 1
+    assert entry["ocr_fingerprint"]
+    assert counters["embedded"] > embedded, "the file must be re-embedded once"
+
+    embedded = counters["embedded"]
+    run(config)                       # third run: settled, nothing to do
+    assert counters["embedded"] == embedded
+
+
+def test_audit_and_dry_run_never_call_the_ocr_engine(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages",
+                        lambda path, config: ([{"page": 1, "text": ""}], None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine()
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    assert run(config, "--audit") == 0
+    assert run(config, "--dry-run") == 0
+
+    assert engine.calls == 0, "read-only modes must never spend money"
+    assert not (tmp_path / "ocr_cache").exists()
+
+
+def test_no_ocr_flag_disables_the_pass(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages",
+                        lambda path, config: ([{"page": 1, "text": ""}], None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine()
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    run(config, "--no-ocr")
+
+    assert engine.calls == 0
+    assert scrap(config, "scan.pdf")["status"] == ingest.NEEDS_OCR
+
+
+def test_ocr_limit_leaves_the_rest_for_the_next_run(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages", lambda path, config: (
+        [{"page": 1, "text": ""}, {"page": 2, "text": ""}, {"page": 3, "text": ""}], None))
+    fake_pdf(monkeypatch, page_count=3)
+    engine = FakeOcrEngine(text="Recovered. " * 30)
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    run(config, "--ocr-limit", "2")
+
+    entry = scrap(config, "scan.pdf")
+    assert engine.calls == 2
+    assert entry["pages_without_text"] == 1
+    assert "ocr_fingerprint" not in entry, "a capped file must stay un-settled"
+
+    run(config)                       # page 1 and 2 come from cache, page 3 is OCR'd
+
+    entry = scrap(config, "scan.pdf")
+    assert entry["pages_without_text"] == 0
+    assert entry["ocr_fingerprint"]
+    assert engine.calls == 3
+
+
+def test_searchable_pdf_artefact_is_written_for_ocrd_files_only(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x", "plain.txt": body()})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages", lambda path, config: (
+        ([{"page": 1, "text": ""}] if path.suffix == ".pdf"
+         else [{"page": None, "text": body()}]), None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="Recovered. " * 30)
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+    written = []
+
+    def fake_ocr(source, destination, **kwargs):
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        Path(destination).write_bytes(b"%PDF-1.4 fake")
+        written.append(destination)
+
+    monkeypatch.setattr(ingest, "ocrmypdf", types.SimpleNamespace(ocr=fake_ocr))
+
+    run(config)
+
+    assert written == [str(tmp_path / "ocr_pdfs" / "scan.pdf")]
+    assert (tmp_path / "ocr_pdfs" / "scan.pdf").exists()
+
+
+def test_partial_ocr_recovery_is_indexed_with_a_note(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"partial.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages", lambda path, config: (
+        [{"page": 1, "text": ""}, {"page": 2, "text": ""}], None))
+    fake_pdf(monkeypatch, page_count=2)
+    engine = FakeOcrEngine(text="abcdefgh")      # recovered, but still far too short
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    run(config)
+
+    entry = scrap(config, "partial.pdf")
+    assert entry["status"] == ingest.INDEXED
+    assert entry["pages_without_text"] == 2
+    assert entry["note"] == "low text layer: only partly recovered"
+
+
+def test_ocr_engine_failure_becomes_an_error_and_is_retried(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "extract_pages",
+                        lambda path, config: ([{"page": 1, "text": ""}], None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(fail=True)
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    run(config)
+
+    entry = scrap(config, "scan.pdf")
+    assert entry["status"] == ingest.ERROR
+    assert "tesseract failed" in entry["note"]
+    assert "ocr_fingerprint" not in entry, "a failed pass must stay retryable"
+    assert engine.calls == 1
+
+    run(config)                       # un-settled, so the next run tries again
+
+    assert engine.calls == 2
+    assert scrap(config, "scan.pdf")["attempts"] == 2
+
+
+def test_searchable_pdf_is_written_when_the_text_came_from_cache(tmp_path, store, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"scan.pdf": "x"})
+    config_path = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(ingest, "extract_pages",
+                        lambda path, config: ([{"page": 1, "text": ""}], None))
+    fake_pdf(monkeypatch)
+    engine = FakeOcrEngine(text="")      # must not run: the cache already has the text
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [engine])
+
+    # Leave the cache exactly as an interrupted earlier run would have.
+    content_hash = ingest.hash_file(corpus / "scan.pdf")
+    identifier = ingest.normalize_path(corpus / "scan.pdf")
+    fingerprint = ingest.ocr_fingerprint(config, ["tesseract"])
+    cache = ingest.OcrCache(config["ocr_cache_path"], identifier, content_hash, fingerprint)
+    cache.set(1, "Recovered earlier. " * 20)
+    cache.save()
+
+    written = []
+
+    def fake_ocr(source, destination, **kwargs):
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        Path(destination).write_bytes(b"%PDF-1.4 fake")
+        written.append(destination)
+
+    monkeypatch.setattr(ingest, "ocrmypdf", types.SimpleNamespace(ocr=fake_ocr))
+
+    run(config_path)
+
+    assert engine.calls == 0, "cached text must not be re-OCR'd"
+    assert not scrap(config_path, "scan.pdf").get("ocr_pages")
+    assert written == [str(tmp_path / "ocr_pdfs" / "scan.pdf")]
+    assert (tmp_path / "ocr_pdfs" / "scan.pdf").exists()
+
+
+def test_an_unknown_backend_warns_and_falls_back(tmp_path, store, capsys, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})
+    config = write_config(tmp_path, corpus, ocr_backend="teseract")   # typo
+    monkeypatch.setattr(ingest, "build_ocr_engines", lambda config: [])
+
+    assert run(config) == 0
+
+    assert "unknown ocr_backend" in capsys.readouterr().err
+
+
+def test_an_unavailable_engine_is_reported_once(tmp_path, store, capsys, monkeypatch):
+    corpus = write_corpus(tmp_path / "corpus", {"a.txt": body()})
+    config = write_config(tmp_path, corpus, ocr_backend="hybrid")
+    monkeypatch.setattr(ingest, "build_ocr_engines",
+                        lambda config: [FakeOcrEngine(name="tesseract", available=False)])
+
+    assert run(config) == 0
+
+    assert "no engine is available" in capsys.readouterr().err

@@ -1,2 +1,1 @@
-add ocr pass
 stack choices(pros, cons) for VEctorDB, Embeddings..Similar aanalysis for other stack entries

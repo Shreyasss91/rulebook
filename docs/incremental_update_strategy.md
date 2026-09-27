@@ -163,7 +163,7 @@ sketch in this document, and why:
 |--------|----------------|-----|
 | `chunk_ids: [...]` stored in the manifest | `chunk_count` only; ids derived as `sha1("<rel_path>\|<content_hash>\|<index>")` | A full corpus would put ~190k ids in the manifest; ids stay deterministic and the collection is pruned by metadata filters instead |
 | Hash only for change detection | size+mtime fast path, SHA256 when either differs, `--full-hash` to override | Avoids re-reading 25k pages on every run |
-| OCR skips on `mtime` + `has_text_layer` | PDFs below `ocr_min_chars_per_page` are marked `needs_ocr` and retried once `OCR_AVAILABLE` is flipped in the script | OCR is not built yet, so retrying today would just repeat the same failure |
+| OCR skips on `mtime` + `has_text_layer` | The OCR pass runs on a writing run between extraction and chunking, page by page, only for pages below `ocr_min_chars_per_page`; already-indexed PDFs with blank pages are re-processed via an `ocr_fingerprint` the manifest stores | The content hash cannot change when derived OCR text is filled in, so the fingerprint is what tells "never attempted" from "recovered" |
 | `process_new_file` etc. as separate steps | Single `process_new_or_modified` that degrades to `pending_embedding` when sentence-transformers/chromadb are absent | Lets the manifest stage be used before the RAG stack is installed |
 | Move = metadata update | Same, plus: a move of a file that was never indexed is reprocessed instead | Re-labelling zero chunks would silently lose the file |
 
@@ -183,7 +183,9 @@ These were not in the first sketch, but each one presents itself as a mass chang
 | Overlapping/nested `docs_source` entries | A file reachable through two roots is scanned once (under the outer root) and the nesting is warned about |
 | File locked / permission denied | `error` status with the reason, run continues; retried up to `max_retries`, then parked for `--strict` |
 | Zero-byte file, blank text file | `empty` (not `needs_ocr` — there is nothing to OCR) |
-| Image-only or low-text PDF | `needs_ocr`, with `pages_without_text` recorded for partially scanned files |
+| Image-only or low-text PDF | OCR fills the pages; text is recovered with its page number, and `pages_without_text` is left for whatever OCR could not read |
+| OCR engine unavailable (no Tesseract/Kannada pack, no API key) | `needs_ocr` with the capability named in `note`; no `attempts` burned, retried automatically once the engine is installed |
+| OCR engine errors on a page (corrupt, timeout) | The page is left uncached and the file becomes `error`, retried up to `max_retries`, then parked for `--strict`; a transient failure never looks like "this page is empty" |
 | Touched but unchanged (mtime only) | UNCHANGED; the new mtime is stored, no re-embedding |
 | Case-only rename on Windows | MOVED via content hash, no re-embedding |
 | Renamed **and** edited | Content hash differs but the dedup signature matches → reported as a hint; the old chunks need a human decision instead of being dropped automatically |
@@ -198,7 +200,7 @@ These were not in the first sketch, but each one presents itself as a mass chang
 2. ~~Add `file_manifest.json` to `.gitignore` (local only, regenerated)~~ ✅
 3. ~~Integrate with existing deduplication (`deduplication_ignore_list.json`)~~ ✅
 4. ~~Test all 4 scenarios~~ ✅ verified on a scratch corpus: add, add-subfolder, edit, move, delete, plus rerun idempotency and dependency-less runs
-5. Add xlsx/xls/csv extraction (currently `unsupported`) and the OCR pipeline (`needs_ocr`)
+5. ~~Add xlsx/xls/csv extraction (`unsupported`)~~ ✅ · ~~Build the OCR pipeline (`needs_ocr`)~~ ✅ (`docs/ocr_pass_design.md`); the real-corpus OCR run is still pending (`D:` mounted, Tesseract + Kannada pack, `NOVITA_API_KEY`)
 6. Schedule via cron (`--strict` exits 2 while files are blocked) or run manually after changes
 7. Consider signature-based move detection for renames that also edit content — today they are
    reported as a hint only, because a wrong automatic merge would silently drop a document

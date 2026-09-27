@@ -10,6 +10,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **OCR pass** (`scripts/incremental_ingest.py`; design and notes in `docs/ocr_pass_design.md`) —
+  recovers pages with no text layer between extraction and chunking, without a full re-ingest:
+  - **Page-level** — only pages below `ocr_min_chars_per_page` are OCR'd, and recovered text keeps
+    its page number, so chunk ids, citations and the embedding path are unchanged. A mixed
+    print/scan file is no longer indexed with citable pages whose content was never extracted
+  - **Engines** — `TesseractEngine` (free, local, needs the binary + `kan` traineddata) and
+    `NovitaEngine` (DeepSeek OCR 2 over the OpenAI-compatible API, key from `ocr_api_key_env`).
+    `ocr_backend` selects `tesseract` / `novita` / `hybrid` / `none`; `hybrid` (default) escalates a
+    page to Novita when Tesseract reads too little. An unknown backend warns and falls back rather
+    than guessing, because the wrong guess can spend money
+  - **Cache** — one JSON per source under `ocr_cache_path`, keyed by `content_hash` + settings +
+    usable engines, so a re-run is free and an interrupted run resumes. Empty text is cached only
+    when an engine ran successfully and found nothing
+  - **Change detection** — `ocr_fingerprint` in the manifest re-processes an already-indexed PDF whose
+    `content_hash` cannot change but whose blank pages were never fixed (`SCHEMA_VERSION` → 2,
+    older manifests still load)
+  - **Statuses** — a missing engine leaves files `needs_ocr` without burning `attempts`; an engine or
+    PDF-open failure is `error`, retried up to `max_retries` and then parked for `--strict`. Failed
+    pages are never cached as "empty", so a transient failure is retried instead of becoming permanent
+  - **Searchable PDFs** — `ocrmypdf --skip-text` mirrors only files that have OCR text (recovered now
+    or answered from the cache) into `ocr_pdf_path`, keyed by `ocr_pdf_hash`/`ocr_pdf_fingerprint`;
+    best-effort, so a missing Ghostscript is a note and the cached text still feeds retrieval
+  - **Cost control** — `--no-ocr` and `--ocr-limit N` (counts attempted pages, so an empty read still
+    draws down the budget), `ocr_max_pages_per_file` per document, and a guarantee that
+    `--dry-run`/`--audit` never build an engine, render a page or touch the cache; `report_ocr()`
+    prints pages OCR'd, cache hits, engine calls, escalations, failures, deferrals and est. API cost
+- Tests for the OCR pass (backend mapping, strict language availability, API payload/response
+  parsing, fingerprinting, cache reuse/invalidation, the page-level trigger, limits and deferral,
+  hybrid escalation, engine/render failures, partial recovery and the searchable-PDF artefact). The
+  engines, renderer and `ocrmypdf` are faked, so the suite still needs no binary, key or network
 - **Office lock-file filtering** — `lock_file_patterns` in `config.yaml` (`~$*` for Word/Excel owner
   files, `.~lock.*#` for LibreOffice) drops those transient artefacts during the scan
   (`scripts/incremental_ingest.py`), matched on the file name *before* the extension filter. The 8
@@ -29,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   questions are settled (2026-09-26) in a decision log that records every option considered, its
   consequences and the rejection reason as well as the choice: `hybrid` as the default backend, a page
   cache plus `ocrmypdf --skip-text` searchable PDFs for affected files only, and strict `eng+kan` with
-  no English-only fallback
+  no English-only fallback — then implemented the same day; §13 records what shipped and where it
+  deviates from the plan
 
 ### Measured on the real corpus (2026-09-25)
 - First `--audit` run against `D:/Office PC/D DRIVE/KERC`: 1,036 files scanned, 55 skipped by the
@@ -43,7 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned
 - Build RAG query interface (CLI + Gradio UI) with citation support
-- Add OCR pipeline integration (Tesseract + Novita.ai DeepSeek OCR 2 hybrid)
 - Signature-based move detection for renames that also edit content (now a hint only)
 
 ---
@@ -360,8 +390,8 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 18 |
-| **Documents** | 6 markdown files (4 in `docs/`, 2 at root) |
+| **Commits** | 30 |
+| **Documents** | 7 markdown files (5 in `docs/`, 2 at root) |
 | **Scripts** | 3 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |

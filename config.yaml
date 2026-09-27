@@ -60,8 +60,26 @@ chroma_path: "kerch_db"
 collection_name: "kerc_docs"
 
 # OCR fallback trigger: PDFs below this many characters per page are considered
-# to have no text layer, and are marked needs_ocr instead of indexed.
+# to have no text layer, and are marked needs_ocr instead of indexed. It is also the
+# per-page trigger of the OCR pass: a page below it gets OCR'd.
 ocr_min_chars_per_page: 50
+
+# --- OCR pass (docs/ocr_pass_design.md) ----------------------------------
+# Runs between extraction and chunking, only for pages with no text layer, and only
+# on a real run (--dry-run/--audit never OCR, so they cannot spend anything).
+ocr_backend: "hybrid"          # none | tesseract | novita | hybrid
+ocr_dpi: 300                   # page render resolution for scanned orders
+ocr_languages: "eng+kan"       # strict: a missing pack parks files, never garbles text
+ocr_cache_path: "data/ocr_cache"   # gitignored; OCR text keyed by content_hash
+ocr_pdf_path: "data/ocr_pdfs"      # gitignored; searchable PDFs for OCR'd files only
+ocr_write_searchable_pdfs: true    # best-effort ocrmypdf --skip-text artefact
+ocr_escalate_below_chars: 200      # hybrid: escalate a page Tesseract read below this
+ocr_max_pages_per_file: 500        # runaway-document cap
+ocr_api_url: "https://api.novita.ai/v3/openai/chat/completions"
+ocr_api_model: "deepseek/deepseek-ocr-2"
+ocr_api_key_env: "NOVITA_API_KEY"  # read from the environment, never from this file
+ocr_api_timeout: 60
+ocr_api_cost_per_page: 0.0001      # only used for the run's cost estimate
 
 # Spreadsheets: rows kept per sheet before the rest are dropped (keeps a huge
 # tariff sheet from becoming one enormous embedding batch).

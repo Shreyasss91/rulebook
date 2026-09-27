@@ -1,8 +1,8 @@
 # OCR Pass — Design
 
-Status: **design, not implemented**. This document is the plan for the deferred
-`add ocr pass` task in `docs/deferred.txt` and the "OCR pipeline integration" milestone in
-`CLAUDE.md`. Nothing here changes the pipeline yet.
+Status: **implemented** (2026-09-26) in `scripts/incremental_ingest.py` — §13 records what
+shipped and where it deviates from the plan below. It has *not* been run against the real corpus
+yet; that is a deliberate manual step (§11 step 4).
 
 Related reading: `docs/origin_doc.md` (engine comparison, pricing, hardware), `docs/kerc_folder_inventory.md`
 (the measured audit), `docs/incremental_update_strategy.md` (manifest model this builds on).
@@ -212,6 +212,11 @@ ocr_pdf_path: "data/ocr_pdfs"      # gitignored; searchable PDFs for the files t
 ocr_write_searchable_pdfs: true    # ocrmypdf --skip-text artefact, best-effort
 ocr_escalate_below_chars: 200      # hybrid: escalate a Tesseract page below this
 ocr_max_pages_per_file: 500        # runaway-document cap
+ocr_api_url: "https://api.novita.ai/v3/openai/chat/completions"
+ocr_api_model: "deepseek/deepseek-ocr-2"
+ocr_api_key_env: "NOVITA_API_KEY"  # read from the environment, never from config.yaml
+ocr_api_timeout: 60
+ocr_api_cost_per_page: 0.0001      # only used for the run's cost estimate
 # ocr_min_chars_per_page: 50       # already exists - the page-level trigger
 ```
 
@@ -242,7 +247,7 @@ key.
 
 ## 11. Rollout
 
-1. **Spike (no code committed).** Run Tesseract on ~20 pages from `OMBUDSMAN ORDERS`/`KPTCL ESCOMS`
+1. **Spike (not done yet).** Run Tesseract on ~20 pages from `OMBUDSMAN ORDERS`/`KPTCL ESCOMS`
    and compare against Novita on the same pages, to confirm quality assumptions in
    `docs/origin_doc.md` on the real scans. Cheap, and it can change the default backend.
 2. **Phase 1 — page-level pass + cache + fingerprint + tests**, with the backend reading `hybrid`
@@ -301,3 +306,60 @@ once: they are re-extracted, re-chunked and re-embedded on the first post-OCR ru
 inherent to fixing pages that were indexed without text (the alternative — a full re-ingest — is
 strictly worse), and it is bounded: `pages_without_text` returns to 0 for those files, after which
 they settle to `UNCHANGED`.
+
+---
+
+## 13. Implementation notes (2026-09-26)
+
+Landed in `scripts/incremental_ingest.py` with a test section in `tests/test_incremental_ingest.py`
+(engine, renderer, cache and `ocrmypdf` all faked — the suite still needs no binary, key or network).
+
+- **Where it runs** — `OcrRunner.fill()` is called from `process_new_or_modified`, between
+  `extract_pages()` and `build_chunks()`, mutating the same page dicts. Chunk ids, page numbers and
+  citations were therefore untouched.
+- **Engines** — `TesseractEngine` (pytesseract; `available()` requires *every* configured language via
+  `get_languages()`, so a missing `kan` pack parks files instead of degrading) and `NovitaEngine`
+  (stdlib `urllib.request`, OpenAI-compatible chat payload, key read from `ocr_api_key_env`).
+  `build_ocr_engines()` maps the backend to a priority list; `main()` drops unavailable engines, so
+  `hybrid` degrades to whichever engine is actually present.
+- **Rendering** — `render_pdf_page()` uses pdfplumber's `to_image(resolution=ocr_dpi)`, so no poppler.
+- **Cache** — `OcrCache` stores one JSON per source file under `ocr_cache_path`, carrying
+  `content_hash` + `fingerprint`; any mismatch discards the whole store rather than reusing part of it.
+  Empty text is cached on purpose *when an engine ran successfully and read nothing*, so a hopeless
+  page is never charged for twice; a page whose engine **failed** is deliberately not cached, so a
+  transient failure is retried instead of being mistaken for an empty page.
+- **Fingerprint** — `ocr_fingerprint()` hashes backend, dpi, languages, per-page threshold,
+  escalation threshold, the API endpoint/model **and the names of the usable engines**, so adding a
+  Novita key (or pointing `ocr_api_url`/`ocr_api_model` at a different service) re-visits pages that
+  were only read by the previous setup. `SCHEMA_VERSION` is now 2 (older manifests load fine).
+- **Settling rule** — the fingerprint is written only when candidates existed, none were left
+  behind, and no engine failed (`attempted and not incomplete and not errors and not fatal`). A run
+  cut short by `--ocr-limit`/`ocr_max_pages_per_file`, or one where an engine errored on a page,
+  stays un-settled so the next run finishes it — and because the pages already done are cache hits,
+  the overlap is free rather than double-charged.
+- **Statuses** — `needs_ocr` when OCR recovered nothing because nothing was readable (a
+  capability/bad-scan gap: no attempts burned, retried only once the fingerprint changes); `error`
+  when an engine or the PDF open failed, which is retried (ceiling `max_retries`) rather than settled.
+  Partial recovery indexes what came back and records the remainder in `pages_without_text`.
+- **Searchable PDFs** — `ensure_searchable_pdf()` calls `ocrmypdf --skip-text`, mirrors only files
+  that have OCR text (recovered this run *or* answered from the cache, so a re-run that only hits the
+  cache still emits the artefact), and records `ocr_pdf_hash` + `ocr_pdf_fingerprint` so it is not
+  regenerated for unchanged content. A missing `ocrmypdf` is reported once per run, not noted against
+  every file.
+- **Cost control** — `--no-ocr`, `--ocr-limit N`, and the guarantee that `--dry-run`/`--audit` never
+  build an engine, render a page or touch the cache. `--ocr-limit` counts *attempted* pages, so a
+  read that comes back empty still draws down the budget (an empty result can still have cost a paid
+  call). `report_ocr()` prints pages OCR'd, cache hits, engine calls, escalations, failed pages,
+  deferred pages and an estimated API cost.
+
+### Deviations from the plan above
+
+- `OCR_AVAILABLE` is kept as a module-level fallback (`False`) for direct callers and tests; real runs
+  pass an explicit `{"available", "fingerprint"}` context into `classify()`. Nothing enables OCR
+  implicitly.
+- `extract_pages()` keeps its two-argument signature — OCR is a separate post-step, so existing
+  callers and monkeypatched tests are unchanged.
+- An unknown `ocr_backend` value warns and falls back to `hybrid` rather than guessing silently,
+  because the wrong guess can spend money.
+- The endpoint and model are config values defaulting to Novita's OpenAI-compatible chat endpoint and
+  `deepseek/deepseek-ocr-2`; the §11 spike should confirm the model string before the real run.
