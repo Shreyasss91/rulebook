@@ -82,6 +82,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not affected)
 
 ### Documentation
+- **`docs/hybrid_retrieval_plan.md`** — the executable plan for the deferred BM25/hybrid milestone
+  (`docs/query_cli_design.md` §8): hand-rolled BM25 over **SQLite FTS5** (external-content table,
+  stdlib `sqlite3` — FTS5 verified present in the project's Python 3.13, so zero new dependencies)
+  instead of migrating to LanceDB, with the store written only inside the existing Chroma upsert/
+  delete/move code paths so the mirror cannot silently drift, stable chunk ids shared across both
+  stores, and **Reciprocal Rank Fusion** (k=60) because BM25 and cosine scores are not comparable —
+  only ranks fuse. `--contains` keeps its hard-filter semantics on top, missing-FTS5/missing-file
+  degrade to today's dense-only behaviour with a warning, a `--rebuild-fts` backfill builds the
+  index from the collection (no re-extraction, no OCR spend), and the config gate
+  (`hybrid_retrieval: false`) stays off until the shared 20-query eval passes its recall gates.
+  Deliberately scheduled to ride the embedder re-index window so the corpus migrates once
 - **`docs/kannada_retrieval_plan.md`** — the executable plan for the gap `docs/stack_choices.md` §3
   identified: the embedder is English-only while the corpus is `eng+kan`, so Kannada passages are
   effectively unretrievable. Covers the `multilingual-e5-small` migration end to end: the mandatory
@@ -133,6 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gradio UI with citations (v1.1.0)
 - Signature-based move detection for renames that also edit content (now a hint only)
 - Hybrid keyword (BM25) retrieval and cross-encoder re-ranking for the query CLI
+  (BM25 plan: `docs/hybrid_retrieval_plan.md`; re-ranking stays out of scope for now)
 
 ---
 
@@ -448,8 +460,8 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 34 |
-| **Documents** | 10 markdown files (8 in `docs/`, 2 at root) |
+| **Commits** | 35 |
+| **Documents** | 11 markdown files (9 in `docs/`, 2 at root) |
 | **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |

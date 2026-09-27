@@ -46,6 +46,7 @@ rule_books/
 │   ├── ocr_pass_design.md                    # OCR pass design, decision log + implementation notes
 │   ├── query_cli_design.md                   # Query CLI design (retrieval, citations, LLMs)
 │   ├── kannada_retrieval_plan.md             # Multilingual embedder migration plan (not implemented)
+│   ├── hybrid_retrieval_plan.md              # BM25 (SQLite FTS5) + RRF fusion plan (not implemented)
 │   └── stack_choices.md                      # VectorDB / Embeddings options + recommendation
 └── scripts/
     ├── scan_extensions.py
@@ -67,6 +68,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `scripts/query_cli.py` | Query CLI: embed question → vector search → cited answer (Ollama/Claude/extractive) |
 | `docs/query_cli_design.md` | Query CLI design: retrieval, page-exact citations, LLM backends, failure modes |
 | `docs/kannada_retrieval_plan.md` | Multilingual embedder migration plan (`multilingual-e5-small`, prefixes, fingerprint, eval set, re-index) — **plan, not implemented** |
+| `docs/hybrid_retrieval_plan.md` | Hybrid retrieval plan: BM25 over SQLite FTS5 fused with dense ranks via RRF — **plan, not implemented** |
 | `docs/stack_choices.md` | Pros/cons and recommendations for the whole stack — Vector DB, embeddings, extraction, chunking, retrieval, LLM, orchestration, UI |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
@@ -278,7 +280,8 @@ page-exact citations (design: `docs/query_cli_design.md`).
 
 - Retrieval reuses `chroma_path`/`collection_name`/`embedding_model`, converts Chroma's cosine
   **distance** to a similarity score, and can require an exact substring (`--contains`) for rule
-  lookups the embedding ranks poorly.
+  lookups the embedding ranks poorly. Hybrid BM25 retrieval is planned, not built:
+  `docs/hybrid_retrieval_plan.md`.
 - Excerpts are numbered `[1]…[k]` in the prompt, the model is told to cite with those markers, and
   the markers are validated after generation — an out-of-range `[n]` is surfaced as a hallucinated
   citation and an answer with no markers is flagged.
