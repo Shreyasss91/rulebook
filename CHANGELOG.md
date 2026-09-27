@@ -82,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not affected)
 
 ### Documentation
+- **`docs/kannada_retrieval_plan.md`** — the executable plan for the gap `docs/stack_choices.md` §3
+  identified: the embedder is English-only while the corpus is `eng+kan`, so Kannada passages are
+  effectively unretrievable. Covers the `multilingual-e5-small` migration end to end: the mandatory
+  `query:`/`passage:` prefixes (a config-keyed `Embedder` change, with the passage prefix folded
+  into `embedding_fingerprint` so a prefix edit re-embeds too), the token-window check for
+  Kannada-dense 1200-char chunks, a 20-query recall@6 eval set with pass/fail gates before any
+  switch, the re-index procedure into a fresh `collection_name` (rollback included), and the
+  escalation path (`e5-base` → BGE-M3/nomic-v2) if `small` misses the gate. Plan only — no code or
+  config changes yet
 - **`docs/stack_choices.md` §5 expanded** — the "similar analysis for other stack entries" is now full
   pros/cons, each with a recommendation and a change trigger: text extraction (`pdfplumber` vs
   PyMuPDF/Docling/pypdf/hosted), chunking (legal-aware vs fixed/semantic/hierarchical/late/contextual),
@@ -120,6 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content and no stale ignore-list entries, confirming all 55 entries match on the real corpus
 
 ### Planned
+- Multilingual embedder switch for Kannada retrieval (plan: `docs/kannada_retrieval_plan.md`)
 - Gradio UI with citations (v1.1.0)
 - Signature-based move detection for renames that also edit content (now a hint only)
 - Hybrid keyword (BM25) retrieval and cross-encoder re-ranking for the query CLI
@@ -438,8 +448,8 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 33 |
-| **Documents** | 9 markdown files (7 in `docs/`, 2 at root) |
+| **Commits** | 34 |
+| **Documents** | 10 markdown files (8 in `docs/`, 2 at root) |
 | **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |

@@ -25,7 +25,8 @@ PDFs → Text Extraction → OCR Fallback → Chunking → Embeddings → Vector
 
 Stack options with pros/cons, the bilingual-retrieval gap and the re-index migration plan live in
 `docs/stack_choices.md` (Vector DB and embeddings in §2–§3, the other entries in §5) — read it before
-changing `embedding_model`, `collection_name` or a pipeline component.
+changing `embedding_model`, `collection_name` or a pipeline component. Executing the embedder
+switch itself is a milestone with its own plan: `docs/kannada_retrieval_plan.md`.
 
 ## Repository Layout
 
@@ -44,6 +45,7 @@ rule_books/
 │   ├── incremental_update_strategy.md       # Manifest-based incremental pipeline design
 │   ├── ocr_pass_design.md                    # OCR pass design, decision log + implementation notes
 │   ├── query_cli_design.md                   # Query CLI design (retrieval, citations, LLMs)
+│   ├── kannada_retrieval_plan.md             # Multilingual embedder migration plan (not implemented)
 │   └── stack_choices.md                      # VectorDB / Embeddings options + recommendation
 └── scripts/
     ├── scan_extensions.py
@@ -64,6 +66,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `scripts/incremental_ingest.py` | Incremental pipeline: manifest diff → extract → OCR → chunk → embed → ChromaDB upsert |
 | `scripts/query_cli.py` | Query CLI: embed question → vector search → cited answer (Ollama/Claude/extractive) |
 | `docs/query_cli_design.md` | Query CLI design: retrieval, page-exact citations, LLM backends, failure modes |
+| `docs/kannada_retrieval_plan.md` | Multilingual embedder migration plan (`multilingual-e5-small`, prefixes, fingerprint, eval set, re-index) — **plan, not implemented** |
 | `docs/stack_choices.md` | Pros/cons and recommendations for the whole stack — Vector DB, embeddings, extraction, chunking, retrieval, LLM, orchestration, UI |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
