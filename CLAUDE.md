@@ -47,6 +47,7 @@ rule_books/
 │   ├── query_cli_design.md                   # Query CLI design (retrieval, citations, LLMs)
 │   ├── kannada_retrieval_plan.md             # Multilingual embedder migration plan (not implemented)
 │   ├── hybrid_retrieval_plan.md              # BM25 (SQLite FTS5) + RRF fusion plan (not implemented)
+│   ├── gradio_ui_design.md                   # v1.1.0 Gradio UI design (not implemented)
 │   └── stack_choices.md                      # VectorDB / Embeddings options + recommendation
 └── scripts/
     ├── scan_extensions.py
@@ -69,6 +70,7 @@ Gitignored and generated at runtime: PDFs, `kerch_db/` (ChromaDB), `data/`, `doc
 | `docs/query_cli_design.md` | Query CLI design: retrieval, page-exact citations, LLM backends, failure modes |
 | `docs/kannada_retrieval_plan.md` | Multilingual embedder migration plan (`multilingual-e5-small`, prefixes, fingerprint, eval set, re-index) — **plan, not implemented** |
 | `docs/hybrid_retrieval_plan.md` | Hybrid retrieval plan: BM25 over SQLite FTS5 fused with dense ranks via RRF — **plan, not implemented** |
+| `docs/gradio_ui_design.md` | Gradio UI design (v1.1.0): thin adapter over `query_cli.py`, citation chips, error mapping — **plan, not implemented** |
 | `docs/stack_choices.md` | Pros/cons and recommendations for the whole stack — Vector DB, embeddings, extraction, chunking, retrieval, LLM, orchestration, UI |
 | `docs/origin_doc.md` | Complete architecture, OCR comparison, hardware assessment, Option A vs B |
 | `docs/incremental_update_strategy.md` | Manifest-based incremental pipeline design |
@@ -322,6 +324,6 @@ page-exact citations (design: `docs/query_cli_design.md`).
 | Milestone | Version |
 |-----------|---------|
 | ~~RAG query CLI with citation support~~ ✅ `scripts/query_cli.py` | v1.0.0 |
-| Gradio UI with citations | v1.1.0 |
+| Gradio UI with citations (design: `docs/gradio_ui_design.md`) | v1.1.0 |
 | OCR pipeline integration (Tesseract + Novita.ai hybrid) | implemented, awaiting the real-corpus run |
 | Scheduled auto-ingest via cron | v1.2.0 |

@@ -42,3 +42,10 @@ xlrd>=2.0.1                # legacy .xls worksheets (xlrd 2.x reads .xls only)
 # the artefact); the Novita API engine is pure stdlib and needs just a key.
 # pytesseract>=0.3.10
 # ocrmypdf>=16.0.0
+
+# --- Optional: Gradio UI (v1.1.0, docs/gradio_ui_design.md) --------------
+# The UI (scripts/query_ui.py, when built) imports gradio lazily, so the test
+# suite and every other script work without it. Pin the version verified on
+# this machine at implementation time; gradio's own dependency pins have
+# clashed with the newest Pythons before.
+# gradio>=5.0

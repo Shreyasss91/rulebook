@@ -82,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not affected)
 
 ### Documentation
+- **`docs/gradio_ui_design.md`** — the v1.1.0 design: a **thin adapter** (`scripts/query_ui.py`,
+  when built) over `query_cli.py`'s library — every question is answered by the same `run_query`
+  call and every source row comes from `QueryResult.to_dict()`, so the UI can never drift from the
+  CLI's behaviour. Covers the Blocks layout (chat + sources table + settings mirroring the CLI
+  flags), citation rendering (validated `[n]` markers as chips; out-of-range ones shown red, never
+  beautified), the CLI-exit-code → UI-state mapping (fallbacks and warnings always visible),
+  loopback-only config (`ui_share` forced off for regulatory documents), `concurrency_limit=1` for
+  the 8 GB machine, lazy gradio import so the suite stays dependency-free, and gradio moving into
+  `requirements.txt`'s commented planned block until implementation
 - **`docs/hybrid_retrieval_plan.md`** — the executable plan for the deferred BM25/hybrid milestone
   (`docs/query_cli_design.md` §8): hand-rolled BM25 over **SQLite FTS5** (external-content table,
   stdlib `sqlite3` — FTS5 verified present in the project's Python 3.13, so zero new dependencies)
@@ -141,7 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned
 - Multilingual embedder switch for Kannada retrieval (plan: `docs/kannada_retrieval_plan.md`)
-- Gradio UI with citations (v1.1.0)
+- Gradio UI with citations (v1.1.0; design: `docs/gradio_ui_design.md`)
 - Signature-based move detection for renames that also edit content (now a hint only)
 - Hybrid keyword (BM25) retrieval and cross-encoder re-ranking for the query CLI
   (BM25 plan: `docs/hybrid_retrieval_plan.md`; re-ranking stays out of scope for now)
@@ -460,8 +469,8 @@ rule_books/
 
 | Metric | Value |
 |--------|-------|
-| **Commits** | 35 |
-| **Documents** | 11 markdown files (9 in `docs/`, 2 at root) |
+| **Commits** | 36 |
+| **Documents** | 12 markdown files (10 in `docs/`, 2 at root) |
 | **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
