@@ -1,1 +1,1 @@
-stack choices(pros, cons) for VEctorDB, Embeddings..Similar aanalysis for other stack entries
+# Deferred tasks. Empty for now — the stack-choices analysis landed in docs/stack_choices.md.

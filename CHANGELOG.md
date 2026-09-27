@@ -71,6 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not affected)
 
 ### Documentation
+- **`docs/stack_choices.md`** — the deferred stack analysis: pros/cons for the vector DB (ChromaDB
+  vs LanceDB/Qdrant/sqlite-vec/FAISS/pgvector and the hosted category) and for embeddings (current
+  `all-MiniLM-L6-v2` vs `multilingual-e5`, BGE-M3, Nomic v2, EmbeddingGemma, Qwen3-Embedding, LaBSE
+  and APIs), scored against the real drivers: local-first privacy, an 8 GB no-GPU machine, 37k chunks
+  and a bilingual corpus. Records the two findings that matter — the current embedder is **English-only
+  while the corpus is `eng+kan`**, so Kannada retrieval is broken and a multilingual model is the next
+  milestone; and the manifest has **no embedding fingerprint**, so changing `embedding_model` silently
+  re-embeds nothing. Recommends keeping ChromaDB, upgrading the embedder after a Kannada spike, and
+  migrating via a new `collection_name` (or adding an `embedding_fingerprint`) before any switch
 - **`docs/ocr_pass_design.md`** — design for the deferred `add ocr pass` task, written before any code:
   page-level OCR that fills only pages with no text layer (`needs_ocr` files plus the 1,246 blank
   pages inside already-indexed files), a Tesseract/Novita engine abstraction with `hybrid`
@@ -413,7 +422,7 @@ rule_books/
 | Metric | Value |
 |--------|-------|
 | **Commits** | 31 |
-| **Documents** | 8 markdown files (6 in `docs/`, 2 at root) |
+| **Documents** | 9 markdown files (7 in `docs/`, 2 at root) |
 | **Scripts** | 4 Python scripts |
 | **Config** | 1 YAML file + 1 requirements file |
 | **Corpus** | 994 PDFs, 25,453 pages (939 unique after dedup) |
